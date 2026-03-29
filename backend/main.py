@@ -44,6 +44,7 @@ def get_snowflake_conn(conn):
         user=conn['db_user'],
         password=conn['db_password'],
         database=conn['db_name'],
+        schema=conn.get('snowflake_schema') or 'PUBLIC',
         warehouse=conn['snowflake_warehouse'],
         role=conn['snowflake_role'],
     )
@@ -87,6 +88,7 @@ class ConnectionCreate(BaseModel):
     db_password: str
     snowflake_warehouse: Optional[str] = None
     snowflake_role: Optional[str] = None
+    snowflake_schema: Optional[str] = None
 
 class PipelineCreate(BaseModel):
     name: str
@@ -112,7 +114,7 @@ def health():
 def list_connections():
     rows = query("""
         SELECT id, name, db_type, host, port, db_name,
-               snowflake_warehouse, snowflake_role,
+               snowflake_warehouse, snowflake_role, snowflake_schema,
                created_at, is_active
         FROM connections ORDER BY created_at DESC
     """)
@@ -146,13 +148,44 @@ def create_connection(body: ConnectionCreate):
     rows = query(
         """INSERT INTO connections
                (name, db_type, host, port, db_name, db_user, db_password,
-                snowflake_warehouse, snowflake_role)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                snowflake_warehouse, snowflake_role, snowflake_schema)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (body.name, body.db_type, body.host, body.port, body.db_name,
          body.db_user, body.db_password,
-         body.snowflake_warehouse, body.snowflake_role)
+         body.snowflake_warehouse, body.snowflake_role, body.snowflake_schema)
     )
     return {"id": rows[0]["id"], "message": "Connection created"}
+
+@app.patch("/connections/{conn_id}")
+def update_connection(conn_id: int, body: ConnectionCreate):
+    try:
+        if body.db_type == 'snowflake':
+            import snowflake.connector
+            test = snowflake.connector.connect(
+                account=body.host, user=body.db_user, password=body.db_password,
+                database=body.db_name, warehouse=body.snowflake_warehouse, role=body.snowflake_role,
+            )
+            test.close()
+        else:
+            test = psycopg2.connect(
+                host=body.host, port=body.port, dbname=body.db_name,
+                user=body.db_user, password=body.db_password, connect_timeout=5
+            )
+            test.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
+
+    query("""
+        UPDATE connections SET
+            name=%s, db_type=%s, host=%s, port=%s, db_name=%s,
+            db_user=%s, db_password=%s,
+            snowflake_warehouse=%s, snowflake_role=%s, snowflake_schema=%s
+        WHERE id=%s
+    """, (body.name, body.db_type, body.host, body.port, body.db_name,
+          body.db_user, body.db_password,
+          body.snowflake_warehouse, body.snowflake_role, body.snowflake_schema,
+          conn_id))
+    return {"message": "Connection updated"}
 
 @app.delete("/connections/{conn_id}")
 def delete_connection(conn_id: int):
@@ -301,6 +334,26 @@ def create_pipeline(body: PipelineCreate):
 
     return {"id": pipeline_id, "message": "Pipeline created", "dag_id": dag_id}
 
+@app.patch("/pipelines/{pipeline_id}")
+def update_pipeline(pipeline_id: int, body: PipelineCreate):
+    query("""
+        UPDATE pipelines SET
+            name = %s,
+            destination_connection_id = %s,
+            watermark_column = %s,
+            merge_key_column = %s,
+            target_schema_name = %s,
+            target_table = %s,
+            volume_alert_upper_pct = %s,
+            volume_alert_lower_pct = %s
+        WHERE id = %s
+    """, (body.name, body.destination_connection_id, body.watermark_column,
+          body.merge_key_column, body.target_schema_name, body.target_table,
+          body.volume_alert_upper_pct, body.volume_alert_lower_pct, pipeline_id))
+    query("UPDATE schedules SET cron_expression = %s WHERE pipeline_id = %s",
+          (body.cron_expression, pipeline_id))
+    return {"message": "Pipeline updated"}
+
 @app.delete("/pipelines/{pipeline_id}")
 def delete_pipeline(pipeline_id: int):
     query("UPDATE pipelines SET is_active = false WHERE id = %s", (pipeline_id,))
@@ -448,7 +501,7 @@ TYPE_MAP = {
 
 def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     sf = get_snowflake_conn(dest_conn)
-    target_schema = (pipeline.get('target_schema_name') or 'ELT_STAGING').upper()
+    target_schema = (dest_conn.get('snowflake_schema') or 'PUBLIC').upper()
     target_table = pipeline['target_table'].upper()
     merge_key = (pipeline.get('merge_key_column') or 'id').lower()
 
@@ -461,7 +514,6 @@ def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     placeholders = ", ".join(["%s"] * len(cols))
 
     with sf.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {target_schema}")
         cur.execute(f"CREATE TABLE IF NOT EXISTS {target_schema}.{target_table} ({col_sql})")
 
         for row in extracted_rows:

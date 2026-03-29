@@ -4,6 +4,7 @@ import { api } from '../api'
 export default function Connections() {
   const [connections, setConnections] = useState([])
   const [showCreate, setShowCreate] = useState(false)
+  const [editConn, setEditConn] = useState(null)
   const [selectedConn, setSelectedConn] = useState(null)
   const [schema, setSchema] = useState(null)
   const [schemaLoading, setSchemaLoading] = useState(false)
@@ -80,6 +81,7 @@ export default function Connections() {
                       conn={conn}
                       selected={selectedConn?.id === conn.id}
                       onClick={() => browseSchema(conn)}
+                      onEdit={() => setEditConn(conn)}
                       onDelete={() => deleteConn(conn.id)}
                       subtitle={`${conn.db_type} · ${conn.host}:${conn.port}/${conn.db_name}`}
                     />
@@ -108,6 +110,7 @@ export default function Connections() {
                       conn={conn}
                       selected={selectedConn?.id === conn.id}
                       onClick={() => { setSelectedConn(conn); setSchema(null) }}
+                      onEdit={() => setEditConn(conn)}
                       onDelete={() => deleteConn(conn.id)}
                       subtitle={`snowflake · ${conn.host} / ${conn.db_name}`}
                       badge={<span className="badge" style={{ background: 'rgba(41,182,246,0.15)', color: '#29b6f6', border: '1px solid rgba(41,182,246,0.3)' }}>❄ snowflake</span>}
@@ -138,6 +141,7 @@ export default function Connections() {
                   {[
                     ['Account', selectedConn.host],
                     ['Database', selectedConn.db_name],
+                    ['Schema', selectedConn.snowflake_schema],
                     ['Warehouse', selectedConn.snowflake_warehouse],
                     ['Role', selectedConn.snowflake_role],
                   ].map(([label, value]) => (
@@ -220,11 +224,18 @@ export default function Connections() {
           onCreated={() => { setShowCreate(false); load() }}
         />
       )}
+      {editConn && (
+        <EditConnectionModal
+          conn={editConn}
+          onClose={() => setEditConn(null)}
+          onSaved={() => { setEditConn(null); load() }}
+        />
+      )}
     </>
   )
 }
 
-function ConnRow({ conn, selected, onClick, onDelete, subtitle, badge }) {
+function ConnRow({ conn, selected, onClick, onEdit, onDelete, subtitle, badge }) {
   return (
     <div
       onClick={onClick}
@@ -247,6 +258,10 @@ function ConnRow({ conn, selected, onClick, onDelete, subtitle, badge }) {
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           {badge || <span className="badge badge-success">● live</span>}
           <button
+            className="btn btn-secondary btn-sm"
+            onClick={e => { e.stopPropagation(); onEdit() }}
+          >✎</button>
+          <button
             className="btn btn-danger btn-sm"
             onClick={e => { e.stopPropagation(); onDelete() }}
           >✕</button>
@@ -267,6 +282,7 @@ function CreateConnectionModal({ onClose, onCreated }) {
     db_password: '',
     snowflake_warehouse: '',
     snowflake_role: '',
+    snowflake_schema: '',
   })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -294,6 +310,7 @@ function CreateConnectionModal({ onClose, onCreated }) {
         port: parseInt(form.port),
         snowflake_warehouse: form.snowflake_warehouse || null,
         snowflake_role: form.snowflake_role || null,
+        snowflake_schema: form.snowflake_schema || null,
       })
       onCreated()
     } catch (e) {
@@ -363,6 +380,11 @@ function CreateConnectionModal({ onClose, onCreated }) {
                     <input className="form-input" value={form.snowflake_role} onChange={e => set('snowflake_role', e.target.value)} placeholder="e.g. ACCOUNTADMIN" />
                   </div>
                 </div>
+                <div className="form-group">
+                  <label className="form-label">Schema</label>
+                  <input className="form-input" value={form.snowflake_schema} onChange={e => set('snowflake_schema', e.target.value)} placeholder="e.g. PUBLIC" />
+                  <div className="form-hint">Target schema within the database. Must already exist in Snowflake.</div>
+                </div>
               </>
             ) : (
               <>
@@ -402,6 +424,134 @@ function CreateConnectionModal({ onClose, onCreated }) {
           <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
           <button className="btn btn-primary" onClick={submit} disabled={loading || !form.name}>
             {loading ? 'Testing connection...' : 'Test & Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EditConnectionModal({ conn, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    name: conn.name,
+    db_type: conn.db_type,
+    host: conn.host,
+    port: String(conn.port),
+    db_name: conn.db_name,
+    db_user: conn.db_user || '',
+    db_password: '',
+    snowflake_warehouse: conn.snowflake_warehouse || '',
+    snowflake_role: conn.snowflake_role || '',
+    snowflake_schema: conn.snowflake_schema || '',
+  })
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+  const isSnowflake = form.db_type === 'snowflake'
+
+  const submit = async () => {
+    setError(null)
+    setLoading(true)
+    try {
+      await api.updateConnection(conn.id, {
+        ...form,
+        port: parseInt(form.port),
+        snowflake_warehouse: form.snowflake_warehouse || null,
+        snowflake_role: form.snowflake_role || null,
+        snowflake_schema: form.snowflake_schema || null,
+      })
+      onSaved()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title">Edit Connection</div>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {error && <div className="alert alert-error">⚠ {error}</div>}
+          <div className="form-grid">
+            <div className="form-group">
+              <label className="form-label">Connection Name</label>
+              <input className="form-input" value={form.name} onChange={e => set('name', e.target.value)} />
+            </div>
+            {isSnowflake ? (
+              <>
+                <div className="form-group">
+                  <label className="form-label">Account Identifier</label>
+                  <input className="form-input" value={form.host} onChange={e => set('host', e.target.value)} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Database</label>
+                  <input className="form-input" value={form.db_name} onChange={e => set('db_name', e.target.value)} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Schema</label>
+                  <input className="form-input" value={form.snowflake_schema} onChange={e => set('snowflake_schema', e.target.value)} placeholder="e.g. PUBLIC" />
+                </div>
+                <div className="form-grid form-grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Username</label>
+                    <input className="form-input" value={form.db_user} onChange={e => set('db_user', e.target.value)} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Password</label>
+                    <input className="form-input" type="password" value={form.db_password} onChange={e => set('db_password', e.target.value)} placeholder="leave blank to keep current" />
+                  </div>
+                </div>
+                <div className="form-grid form-grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Warehouse</label>
+                    <input className="form-input" value={form.snowflake_warehouse} onChange={e => set('snowflake_warehouse', e.target.value)} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Role</label>
+                    <input className="form-input" value={form.snowflake_role} onChange={e => set('snowflake_role', e.target.value)} />
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="form-grid form-grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Host</label>
+                    <input className="form-input" value={form.host} onChange={e => set('host', e.target.value)} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Port</label>
+                    <input className="form-input" type="number" value={form.port} onChange={e => set('port', e.target.value)} />
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Database</label>
+                  <input className="form-input" value={form.db_name} onChange={e => set('db_name', e.target.value)} />
+                </div>
+                <div className="form-grid form-grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Username</label>
+                    <input className="form-input" value={form.db_user} onChange={e => set('db_user', e.target.value)} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Password</label>
+                    <input className="form-input" type="password" value={form.db_password} onChange={e => set('db_password', e.target.value)} placeholder="leave blank to keep current" />
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={loading || !form.name}>
+            {loading ? 'Testing & saving...' : 'Test & Save'}
           </button>
         </div>
       </div>

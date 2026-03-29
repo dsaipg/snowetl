@@ -20,6 +20,7 @@ export const api = {
   // Connections
   getConnections: () => request('/connections'),
   createConnection: (data) => request('/connections', { method: 'POST', body: data }),
+  updateConnection: (id, data) => request(`/connections/${id}`, { method: 'PATCH', body: data }),
   deleteConnection: (id) => request(`/connections/${id}`, { method: 'DELETE' }),
 
   // Schema
@@ -30,6 +31,7 @@ export const api = {
   getPipelines: () => request('/pipelines'),
   getPipeline: (id) => request(`/pipelines/${id}`),
   createPipeline: (data) => request('/pipelines', { method: 'POST', body: data }),
+  updatePipeline: (id, data) => request(`/pipelines/${id}`, { method: 'PATCH', body: data }),
   deletePipeline: (id) => request(`/pipelines/${id}`, { method: 'DELETE' }),
   triggerPipeline: (id) => request(`/pipelines/${id}/trigger`, { method: 'POST' }),
 

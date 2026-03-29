@@ -4,6 +4,7 @@ import { api } from '../api'
 export default function Pipelines() {
   const [pipelines, setPipelines] = useState([])
   const [showCreate, setShowCreate] = useState(false)
+  const [editPipeline, setEditPipeline] = useState(null)
   const [loading, setLoading] = useState(true)
   const [triggering, setTriggering] = useState({})
   const [runResults, setRunResults] = useState({})
@@ -123,6 +124,10 @@ export default function Pipelines() {
                               {triggering[p.id] ? '⟳ Running...' : '▷ Run'}
                             </button>
                             <button
+                              className="btn btn-secondary btn-sm"
+                              onClick={() => setEditPipeline(p)}
+                            >✎ Edit</button>
+                            <button
                               className="btn btn-danger btn-sm"
                               onClick={() => deletePipeline(p.id)}
                             >✕</button>
@@ -158,6 +163,13 @@ export default function Pipelines() {
         <CreatePipelineModal
           onClose={() => setShowCreate(false)}
           onCreated={() => { setShowCreate(false); load() }}
+        />
+      )}
+      {editPipeline && (
+        <EditPipelineModal
+          pipeline={editPipeline}
+          onClose={() => setEditPipeline(null)}
+          onSaved={() => { setEditPipeline(null); load() }}
         />
       )}
     </>
@@ -336,16 +348,11 @@ function CreatePipelineModal({ onClose, onCreated }) {
                   <div className="form-hint">No Snowflake connections yet — add one on the Connections page</div>
                 )}
               </div>
-              {form.destination_connection_id && (
-                <div className="form-group">
-                  <label className="form-label">Target Schema</label>
-                  <input
-                    className="form-input"
-                    value={form.target_schema_name}
-                    onChange={e => set('target_schema_name', e.target.value)}
-                    placeholder="e.g. ELT_STAGING"
-                  />
-                  <div className="form-hint">Schema will be created in Snowflake if it doesn't exist</div>
+              {selectedDestination && (
+                <div className="form-hint" style={{ padding: '8px 12px', background: 'var(--bg)', borderRadius: 6, border: '1px solid var(--border)' }}>
+                  Writing to: <span style={{ fontFamily: 'var(--mono)', color: 'var(--accent)' }}>
+                    {selectedDestination.db_name}.{selectedDestination.snowflake_schema || 'PUBLIC'}
+                  </span>
                 </div>
               )}
               {pipelines.length > 0 && (
@@ -467,7 +474,9 @@ function CreatePipelineModal({ onClose, onCreated }) {
                         />
                         <div className="form-hint">
                           Will land at: <span style={{ fontFamily: 'var(--mono)', color: 'var(--accent)' }}>
-                            {selectedDestination ? `${selectedDestination.db_name}.${form.target_schema_name}` : 'snowflake_target'}.{form.target_table || '…'}
+                            {selectedDestination
+                              ? `${selectedDestination.db_name}.${selectedDestination.snowflake_schema || 'PUBLIC'}`
+                              : 'snowflake_target'}.{form.target_table || '…'}
                           </span>
                         </div>
                       </div>
@@ -521,7 +530,7 @@ function CreatePipelineModal({ onClose, onCreated }) {
                 ['Source Connection', sources.find(c => c.id === parseInt(form.connection_id))?.name || '—'],
                 ['Source Table', form.source_table],
                 ['Destination', selectedDestination ? `❄ ${selectedDestination.name}` : 'Mock (local Postgres)'],
-                ['Target', `${selectedDestination ? `${selectedDestination.db_name}.${form.target_schema_name}` : 'snowflake_target'}.${form.target_table}`],
+                ['Target', `${selectedDestination ? `${selectedDestination.db_name}.${selectedDestination.snowflake_schema || 'PUBLIC'}` : 'snowflake_target'}.${form.target_table}`],
                 ['Watermark Column', form.watermark_column || 'None (full extract)'],
                 ['Merge Key', form.merge_key_column || 'Not set'],
                 ['Schedule', form.cron_expression],
@@ -566,4 +575,123 @@ function CreatePipelineModal({ onClose, onCreated }) {
   function toggleTable(name) {
     setExpandedTables(prev => ({ ...prev, [name]: !prev[name] }))
   }
+}
+
+function EditPipelineModal({ pipeline, onClose, onSaved }) {
+  const [connections, setConnections] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  const [form, setForm] = useState({
+    name: pipeline.name,
+    connection_id: pipeline.connection_id,
+    destination_connection_id: pipeline.destination_connection_id || '',
+    source_table: pipeline.source_table,
+    watermark_column: pipeline.watermark_column || '',
+    merge_key_column: pipeline.merge_key_column || '',
+    target_schema_name: pipeline.target_schema_name || 'ELT_STAGING',
+    target_table: pipeline.target_table,
+    cron_expression: pipeline.cron_expression || '0 2 * * *',
+    depends_on: pipeline.depends_on || [],
+    volume_alert_upper_pct: pipeline.volume_alert_upper_pct || 200,
+    volume_alert_lower_pct: pipeline.volume_alert_lower_pct || 50,
+  })
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+  const destinations = connections.filter(c => c.db_type === 'snowflake')
+
+  useEffect(() => { api.getConnections().then(setConnections) }, [])
+
+  const submit = async () => {
+    setError(null)
+    setLoading(true)
+    try {
+      await api.updatePipeline(pipeline.id, {
+        ...form,
+        connection_id: parseInt(form.connection_id),
+        destination_connection_id: form.destination_connection_id ? parseInt(form.destination_connection_id) : null,
+      })
+      onSaved()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title">Edit Pipeline</div>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {error && <div className="alert alert-error">⚠ {error}</div>}
+          <div className="form-grid">
+            <div className="form-group">
+              <label className="form-label">Pipeline Name</label>
+              <input className="form-input" value={form.name} onChange={e => set('name', e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Destination</label>
+              <select className="form-select" value={form.destination_connection_id} onChange={e => set('destination_connection_id', e.target.value)}>
+                <option value="">Mock (local Postgres)</option>
+                {destinations.map(c => (
+                  <option key={c.id} value={c.id}>❄ {c.name}</option>
+                ))}
+              </select>
+            </div>
+            {form.destination_connection_id && (
+              <div className="form-group">
+                <label className="form-label">Target Schema</label>
+                <input className="form-input" value={form.target_schema_name} onChange={e => set('target_schema_name', e.target.value)} placeholder="ELT_STAGING" />
+              </div>
+            )}
+            <div className="form-group">
+              <label className="form-label">Target Table</label>
+              <input className="form-input" value={form.target_table} onChange={e => set('target_table', e.target.value)} />
+            </div>
+            <div className="form-grid form-grid-2">
+              <div className="form-group">
+                <label className="form-label">Watermark Column</label>
+                <input className="form-input" value={form.watermark_column} onChange={e => set('watermark_column', e.target.value)} placeholder="e.g. updated_at" />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Merge Key Column</label>
+                <input className="form-input" value={form.merge_key_column} onChange={e => set('merge_key_column', e.target.value)} placeholder="e.g. id" />
+              </div>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Cron Schedule</label>
+              <select className="form-select" value={form.cron_expression} onChange={e => set('cron_expression', e.target.value)}>
+                <option value="0 2 * * *">Daily at 2:00 AM</option>
+                <option value="0 3 * * *">Daily at 3:00 AM</option>
+                <option value="0 0 * * *">Daily at Midnight</option>
+                <option value="0 */6 * * *">Every 6 hours</option>
+                <option value="0 * * * *">Hourly</option>
+                <option value="0 2 * * 1">Weekly (Monday 2am)</option>
+              </select>
+            </div>
+            <div className="form-grid form-grid-2">
+              <div className="form-group">
+                <label className="form-label">Volume Alert: Lower %</label>
+                <input className="form-input" type="number" value={form.volume_alert_lower_pct} onChange={e => set('volume_alert_lower_pct', parseInt(e.target.value))} />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Volume Alert: Upper %</label>
+                <input className="form-input" type="number" value={form.volume_alert_upper_pct} onChange={e => set('volume_alert_upper_pct', parseInt(e.target.value))} />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={loading || !form.name}>
+            {loading ? 'Saving...' : '✓ Save Changes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }

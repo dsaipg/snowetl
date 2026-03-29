@@ -34,6 +34,7 @@ CREATE TABLE connections (
     -- Snowflake-specific fields
     snowflake_warehouse VARCHAR(255),
     snowflake_role VARCHAR(255),
+    snowflake_schema VARCHAR(255),
     created_by INTEGER,
     created_at TIMESTAMP DEFAULT NOW(),
     is_active BOOLEAN DEFAULT true
