@@ -44,6 +44,11 @@ export const api = {
   // Dependencies
   getDependencies: () => request('/dependencies'),
 
+  // Promotion
+  exportPipeline: (id) => request(`/pipelines/${id}/export`),
+  promotePipeline: (id, targetBackendUrl) =>
+    request(`/pipelines/${id}/promote`, { method: 'POST', body: { target_backend_url: targetBackendUrl } }),
+
   // Schema drift
   getPipelineDrift: (pipelineId) => request(`/pipelines/${pipelineId}/drift`),
   getAllPendingDrift: () => request('/drift/pending'),

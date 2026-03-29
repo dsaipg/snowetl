@@ -1,13 +1,130 @@
 import { useState, useEffect } from 'react'
 import { api } from '../api'
 
+const QA_URL   = import.meta.env.VITE_QA_API_URL   || ''
+const PROD_URL = import.meta.env.VITE_PROD_API_URL  || ''
+
+function PromoteModal({ pipeline, onClose }) {
+  const presets = [
+    QA_URL   ? { label: 'QA',   url: QA_URL }   : null,
+    PROD_URL ? { label: 'Prod', url: PROD_URL }  : null,
+  ].filter(Boolean)
+
+  const [targetUrl, setTargetUrl] = useState(presets[0]?.url || '')
+  const [status, setStatus]       = useState(null)   // null | 'loading' | {ok, message}
+
+  const promote = async () => {
+    if (!targetUrl.trim()) return
+    setStatus('loading')
+    try {
+      const r = await api.promotePipeline(pipeline.id, targetUrl.trim())
+      setStatus({ ok: true, message: `Promoted to ${targetUrl} — pipeline ID ${r.target_pipeline_id}` })
+    } catch (e) {
+      setStatus({ ok: false, message: e.message })
+    }
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: '#000000cc',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 1000, backdropFilter: 'blur(4px)',
+    }} onClick={onClose}>
+      <div style={{
+        background: 'var(--surface)', border: '1px solid var(--border)',
+        borderRadius: 12, width: 480, padding: 28,
+        boxShadow: '0 0 60px #00d4aa22',
+      }} onClick={e => e.stopPropagation()}>
+
+        <div style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', fontSize: 11, letterSpacing: 2, marginBottom: 6 }}>
+          PROMOTE PIPELINE
+        </div>
+        <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 20 }}>{pipeline.name}</div>
+
+        <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.6 }}>
+          Copies this pipeline config to another environment's backend.
+          The target environment must have connections with the same names:
+          <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)', marginLeft: 6 }}>
+            {pipeline.connection_name}
+            {pipeline.destination_name ? ` + ${pipeline.destination_name}` : ''}
+          </span>
+        </div>
+
+        {presets.length > 0 && (
+          <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+            {presets.map(p => (
+              <button key={p.label} onClick={() => setTargetUrl(p.url)} style={{
+                background: targetUrl === p.url ? '#00d4aa22' : 'var(--bg)',
+                border: `1px solid ${targetUrl === p.url ? 'var(--accent)' : 'var(--border)'}`,
+                color: targetUrl === p.url ? 'var(--accent)' : 'var(--text-muted)',
+                borderRadius: 6, padding: '5px 14px',
+                fontFamily: 'var(--mono)', fontSize: 12, cursor: 'pointer',
+              }}>{p.label}</button>
+            ))}
+          </div>
+        )}
+
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-muted)', marginBottom: 6, letterSpacing: 1 }}>
+            TARGET BACKEND URL
+          </div>
+          <input
+            value={targetUrl}
+            onChange={e => setTargetUrl(e.target.value)}
+            placeholder="https://api.qa.yourplatform.com"
+            style={{
+              width: '100%', background: 'var(--bg)', border: '1px solid var(--border)',
+              color: 'var(--text)', borderRadius: 6, padding: '9px 12px',
+              fontFamily: 'var(--mono)', fontSize: 13, boxSizing: 'border-box',
+            }}
+          />
+        </div>
+
+        {status && status !== 'loading' && (
+          <div style={{
+            padding: '10px 14px', borderRadius: 6, marginBottom: 16,
+            background: status.ok ? '#00d4aa11' : '#ef444411',
+            border: `1px solid ${status.ok ? '#00d4aa44' : '#ef444444'}`,
+            color: status.ok ? 'var(--accent)' : '#ef4444',
+            fontFamily: 'var(--mono)', fontSize: 12,
+          }}>
+            {status.ok ? '✓ ' : '✕ '}{status.message}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button onClick={onClose} style={{
+            background: 'transparent', border: '1px solid var(--border)',
+            color: 'var(--text-muted)', borderRadius: 6, padding: '8px 18px',
+            fontFamily: 'var(--mono)', fontSize: 12, cursor: 'pointer',
+          }}>Cancel</button>
+          <button
+            onClick={promote}
+            disabled={!targetUrl.trim() || status === 'loading' || status?.ok}
+            style={{
+              background: 'var(--accent)', border: 'none', color: '#000',
+              borderRadius: 6, padding: '8px 18px',
+              fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700,
+              cursor: (!targetUrl.trim() || status === 'loading' || status?.ok) ? 'not-allowed' : 'pointer',
+              opacity: (!targetUrl.trim() || status === 'loading' || status?.ok) ? 0.5 : 1,
+            }}
+          >
+            {status === 'loading' ? '⟳ Promoting...' : 'Promote'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function Pipelines() {
-  const [pipelines, setPipelines] = useState([])
-  const [showCreate, setShowCreate] = useState(false)
+  const [pipelines, setPipelines]     = useState([])
+  const [showCreate, setShowCreate]   = useState(false)
   const [editPipeline, setEditPipeline] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [triggering, setTriggering] = useState({})
-  const [runResults, setRunResults] = useState({})
+  const [promotePipeline, setPromotePipeline] = useState(null)
+  const [loading, setLoading]         = useState(true)
+  const [triggering, setTriggering]   = useState({})
+  const [runResults, setRunResults]   = useState({})
 
   const load = () => api.getPipelines().then(setPipelines).finally(() => setLoading(false))
   useEffect(() => { load() }, [])
@@ -128,6 +245,11 @@ export default function Pipelines() {
                               onClick={() => setEditPipeline(p)}
                             >✎ Edit</button>
                             <button
+                              className="btn btn-secondary btn-sm"
+                              onClick={() => setPromotePipeline(p)}
+                              title="Promote to another environment"
+                            >↑ Promote</button>
+                            <button
                               className="btn btn-danger btn-sm"
                               onClick={() => deletePipeline(p.id)}
                             >✕</button>
@@ -170,6 +292,12 @@ export default function Pipelines() {
           pipeline={editPipeline}
           onClose={() => setEditPipeline(null)}
           onSaved={() => { setEditPipeline(null); load() }}
+        />
+      )}
+      {promotePipeline && (
+        <PromoteModal
+          pipeline={promotePipeline}
+          onClose={() => setPromotePipeline(null)}
         />
       )}
     </>

@@ -801,6 +801,113 @@ def volume_history(pipeline_id: int):
     """, (pipeline_id,))
     return [dict(r) for r in rows]
 
+# ─── Promotion ────────────────────────────────────────────────────────
+@app.get("/pipelines/{pipeline_id}/export")
+def export_pipeline(pipeline_id: int):
+    """Return pipeline config as a portable JSON blob (no env-specific IDs)."""
+    rows = query("SELECT * FROM pipelines WHERE id = %s", (pipeline_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    p = dict(rows[0])
+
+    src = query("SELECT name, db_type FROM connections WHERE id = %s", (p['connection_id'],))
+    dst = query("SELECT name, db_type FROM connections WHERE id = %s", (p['destination_connection_id'],)) if p.get('destination_connection_id') else []
+    sched = query("SELECT cron_expression FROM schedules WHERE pipeline_id = %s", (pipeline_id,))
+    deps = query("SELECT depends_on_id FROM pipeline_dependencies WHERE pipeline_id = %s", (pipeline_id,))
+
+    return {
+        "name":                  p['name'],
+        "source_connection_name": src[0]['name'] if src else None,
+        "destination_connection_name": dst[0]['name'] if dst else None,
+        "source_table":          p['source_table'],
+        "watermark_column":      p['watermark_column'],
+        "merge_key_column":      p['merge_key_column'],
+        "target_database":       p['target_database'],
+        "target_schema_name":    p['target_schema_name'],
+        "target_table":          p['target_table'],
+        "cron_expression":       sched[0]['cron_expression'] if sched else '0 2 * * *',
+        "volume_alert_upper_pct": p['volume_alert_upper_pct'],
+        "volume_alert_lower_pct": p['volume_alert_lower_pct'],
+        "depends_on_names":      [],   # dependency names resolved at import time
+    }
+
+class PromoteRequest(BaseModel):
+    target_backend_url: str   # e.g. http://qa-backend:8000 or https://api.qa.myplatform.com
+
+@app.post("/pipelines/{pipeline_id}/promote")
+def promote_pipeline(pipeline_id: int, body: PromoteRequest):
+    """
+    Copy a pipeline to another environment's backend.
+
+    Steps:
+      1. Export pipeline config (connection names, not IDs)
+      2. Call GET {target}/connections to find matching connections by name
+      3. Call POST {target}/pipelines to create the pipeline there
+    """
+    import httpx
+
+    target = body.target_backend_url.rstrip('/')
+
+    # ── 1. Export from this env ──────────────────────────────────────────────
+    exported = export_pipeline(pipeline_id)
+
+    # ── 2. Resolve connections in target env by name ─────────────────────────
+    try:
+        r = httpx.get(f"{target}/connections", timeout=15)
+        r.raise_for_status()
+        target_conns = {c['name']: c['id'] for c in r.json()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach target env: {e}")
+
+    src_name = exported['source_connection_name']
+    dst_name = exported['destination_connection_name']
+
+    if src_name and src_name not in target_conns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source connection '{src_name}' not found in target env. "
+                   f"Create it there first. Available: {list(target_conns.keys())}"
+        )
+    if dst_name and dst_name not in target_conns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Destination connection '{dst_name}' not found in target env. "
+                   f"Create it there first. Available: {list(target_conns.keys())}"
+        )
+
+    # ── 3. Create pipeline in target env ─────────────────────────────────────
+    payload = {
+        "name":                     exported['name'],
+        "connection_id":            target_conns[src_name],
+        "destination_connection_id": target_conns[dst_name] if dst_name else None,
+        "source_table":             exported['source_table'],
+        "watermark_column":         exported['watermark_column'],
+        "merge_key_column":         exported['merge_key_column'],
+        "target_database":          exported['target_database'],
+        "target_schema_name":       exported['target_schema_name'],
+        "target_table":             exported['target_table'],
+        "cron_expression":          exported['cron_expression'],
+        "volume_alert_upper_pct":   exported['volume_alert_upper_pct'],
+        "volume_alert_lower_pct":   exported['volume_alert_lower_pct'],
+        "depends_on":               [],
+    }
+
+    try:
+        r = httpx.post(f"{target}/pipelines", json=payload, timeout=15)
+        r.raise_for_status()
+        result = r.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f"Target env rejected pipeline: {e.response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Promotion failed: {e}")
+
+    return {
+        "message": f"Pipeline '{exported['name']}' promoted successfully",
+        "target_pipeline_id": result.get('id'),
+        "target_backend_url": target,
+    }
+
+
 @app.get("/dependencies")
 def get_all_dependencies():
     rows = query("""
