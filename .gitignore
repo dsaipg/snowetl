@@ -1,0 +1,24 @@
+# Dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Docker volumes (local data)
+postgres-data/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude memory
+.claude/

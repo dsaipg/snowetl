@@ -1,0 +1,564 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import psycopg2
+import psycopg2.extras
+import os
+import json
+import time
+import random
+from datetime import datetime, timedelta
+from typing import Optional
+from pydantic import BaseModel
+
+# ─── Config from env vars ─────────────────────────────────────────────
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "etlplatform")
+DB_USER = os.getenv("DB_USER", "etluser")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "etlpassword")
+
+AIRFLOW_ENDPOINT = os.getenv("AIRFLOW_ENDPOINT", "http://localhost:8080")
+AIRFLOW_USER = os.getenv("AIRFLOW_USER", "admin")
+AIRFLOW_PASSWORD = os.getenv("AIRFLOW_PASSWORD", "admin")
+
+ENVIRONMENT = os.getenv("ENVIRONMENT", "local")
+
+# ─── DB helpers ──────────────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD
+    )
+
+def get_source_db(host, port, dbname, user, password):
+    return psycopg2.connect(
+        host=host, port=port, dbname=dbname,
+        user=user, password=password
+    )
+
+def get_snowflake_conn(conn):
+    import snowflake.connector
+    return snowflake.connector.connect(
+        account=conn['host'],
+        user=conn['db_user'],
+        password=conn['db_password'],
+        database=conn['db_name'],
+        warehouse=conn['snowflake_warehouse'],
+        role=conn['snowflake_role'],
+    )
+
+def query(sql, params=None, db=None):
+    conn = db or get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            conn.commit()
+            try:
+                return cur.fetchall()
+            except:
+                return []
+    finally:
+        if not db:
+            conn.close()
+
+# ─── App ─────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+app = FastAPI(title="ELT Platform API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Models ──────────────────────────────────────────────────────────
+class ConnectionCreate(BaseModel):
+    name: str
+    db_type: str
+    host: str
+    port: int = 443
+    db_name: str
+    db_user: str
+    db_password: str
+    snowflake_warehouse: Optional[str] = None
+    snowflake_role: Optional[str] = None
+
+class PipelineCreate(BaseModel):
+    name: str
+    connection_id: int
+    destination_connection_id: Optional[int] = None
+    source_table: str
+    watermark_column: Optional[str] = None
+    merge_key_column: Optional[str] = None
+    target_schema_name: str = 'ELT_STAGING'
+    target_table: str
+    cron_expression: str = "0 2 * * *"
+    depends_on: list[int] = []
+    volume_alert_upper_pct: int = 200
+    volume_alert_lower_pct: int = 50
+
+# ─── Health ──────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok", "environment": ENVIRONMENT}
+
+# ─── Connections ─────────────────────────────────────────────────────
+@app.get("/connections")
+def list_connections():
+    rows = query("""
+        SELECT id, name, db_type, host, port, db_name,
+               snowflake_warehouse, snowflake_role,
+               created_at, is_active
+        FROM connections ORDER BY created_at DESC
+    """)
+    return [dict(r) for r in rows]
+
+@app.post("/connections")
+def create_connection(body: ConnectionCreate):
+    # Test connection
+    try:
+        if body.db_type == 'snowflake':
+            import snowflake.connector
+            test = snowflake.connector.connect(
+                account=body.host,
+                user=body.db_user,
+                password=body.db_password,
+                database=body.db_name,
+                warehouse=body.snowflake_warehouse,
+                role=body.snowflake_role,
+            )
+            test.close()
+        else:
+            test = psycopg2.connect(
+                host=body.host, port=body.port,
+                dbname=body.db_name, user=body.db_user,
+                password=body.db_password, connect_timeout=5
+            )
+            test.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
+
+    rows = query(
+        """INSERT INTO connections
+               (name, db_type, host, port, db_name, db_user, db_password,
+                snowflake_warehouse, snowflake_role)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (body.name, body.db_type, body.host, body.port, body.db_name,
+         body.db_user, body.db_password,
+         body.snowflake_warehouse, body.snowflake_role)
+    )
+    return {"id": rows[0]["id"], "message": "Connection created"}
+
+@app.delete("/connections/{conn_id}")
+def delete_connection(conn_id: int):
+    query("UPDATE connections SET is_active = false WHERE id = %s", (conn_id,))
+    return {"message": "Connection deleted"}
+
+# ─── Schema Discovery ─────────────────────────────────────────────────
+@app.get("/connections/{conn_id}/schema")
+def discover_schema(conn_id: int, refresh: bool = False):
+    conns = query("SELECT * FROM connections WHERE id = %s", (conn_id,))
+    if not conns:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    conn = dict(conns[0])
+
+    if conn['db_type'] == 'snowflake':
+        raise HTTPException(status_code=400, detail="Schema discovery is only available for source connections")
+
+    if not refresh:
+        cached = query(
+            "SELECT * FROM schemas WHERE connection_id = %s ORDER BY table_name, column_name",
+            (conn_id,)
+        )
+        if cached:
+            return _group_schema(cached)
+
+    try:
+        src = get_source_db(
+            host=conn["host"], port=conn["port"],
+            dbname=conn["db_name"], user=conn["db_user"],
+            password=conn["db_password"]
+        )
+        with src.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                AND table_name NOT LIKE 'pg_%'
+                ORDER BY table_name, ordinal_position
+            """)
+            columns = cur.fetchall()
+        src.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Schema discovery failed: {str(e)}")
+
+    query("DELETE FROM schemas WHERE connection_id = %s", (conn_id,))
+
+    watermark_names = {'updated_at', 'modified_at', 'last_modified', 'update_date', 'changed_at', 'modified_date'}
+    watermark_types = {'timestamp', 'timestamp without time zone', 'timestamp with time zone', 'date'}
+
+    for col in columns:
+        is_watermark = (
+            col['column_name'].lower() in watermark_names or
+            (col['data_type'].lower() in watermark_types and 'update' in col['column_name'].lower())
+        )
+        query(
+            """INSERT INTO schemas (connection_id, table_name, column_name, data_type, is_suggested_watermark)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (conn_id, col['table_name'], col['column_name'], col['data_type'], is_watermark)
+        )
+
+    cached = query(
+        "SELECT * FROM schemas WHERE connection_id = %s ORDER BY table_name, column_name",
+        (conn_id,)
+    )
+    return _group_schema(cached)
+
+def _group_schema(rows):
+    tables = {}
+    for row in rows:
+        row = dict(row)
+        t = row['table_name']
+        if t not in tables:
+            tables[t] = {"table_name": t, "columns": []}
+        tables[t]["columns"].append({
+            "name": row["column_name"],
+            "type": row["data_type"],
+            "is_suggested_watermark": row["is_suggested_watermark"]
+        })
+    return list(tables.values())
+
+# ─── Pipelines ────────────────────────────────────────────────────────
+@app.get("/pipelines")
+def list_pipelines():
+    rows = query("""
+        SELECT p.*, c.name as connection_name, c.db_type,
+               s.cron_expression,
+               dc.name as destination_name, dc.db_type as destination_db_type,
+               (SELECT COUNT(*) FROM job_runs jr WHERE jr.pipeline_id = p.id) as total_runs,
+               (SELECT status FROM job_runs jr WHERE jr.pipeline_id = p.id ORDER BY started_at DESC LIMIT 1) as last_status,
+               (SELECT started_at FROM job_runs jr WHERE jr.pipeline_id = p.id ORDER BY started_at DESC LIMIT 1) as last_run_at,
+               (SELECT rows_loaded FROM job_runs jr WHERE jr.pipeline_id = p.id ORDER BY started_at DESC LIMIT 1) as last_rows_loaded
+        FROM pipelines p
+        LEFT JOIN connections c ON p.connection_id = c.id
+        LEFT JOIN connections dc ON p.destination_connection_id = dc.id
+        LEFT JOIN schedules s ON s.pipeline_id = p.id
+        WHERE p.is_active = true
+        ORDER BY p.created_at DESC
+    """)
+    result = []
+    for row in rows:
+        r = dict(row)
+        deps = query("SELECT depends_on_id FROM pipeline_dependencies WHERE pipeline_id = %s", (r['id'],))
+        r['depends_on'] = [d['depends_on_id'] for d in deps]
+        result.append(r)
+    return result
+
+@app.get("/pipelines/{pipeline_id}")
+def get_pipeline(pipeline_id: int):
+    rows = query("SELECT * FROM pipelines WHERE id = %s", (pipeline_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    r = dict(rows[0])
+    deps = query("SELECT depends_on_id FROM pipeline_dependencies WHERE pipeline_id = %s", (pipeline_id,))
+    r['depends_on'] = [d['depends_on_id'] for d in deps]
+    schedule = query("SELECT * FROM schedules WHERE pipeline_id = %s", (pipeline_id,))
+    r['schedule'] = dict(schedule[0]) if schedule else None
+    return r
+
+@app.post("/pipelines")
+def create_pipeline(body: PipelineCreate):
+    dag_id = f"pipeline_{int(time.time())}"
+
+    rows = query(
+        """INSERT INTO pipelines
+               (name, connection_id, destination_connection_id, source_table,
+                watermark_column, merge_key_column, target_schema_name,
+                target_table, volume_alert_upper_pct, volume_alert_lower_pct, dag_id)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (body.name, body.connection_id, body.destination_connection_id,
+         body.source_table, body.watermark_column, body.merge_key_column,
+         body.target_schema_name, body.target_table,
+         body.volume_alert_upper_pct, body.volume_alert_lower_pct, dag_id)
+    )
+    pipeline_id = rows[0]['id']
+
+    query(
+        "INSERT INTO schedules (pipeline_id, cron_expression) VALUES (%s, %s)",
+        (pipeline_id, body.cron_expression)
+    )
+
+    for dep_id in body.depends_on:
+        query(
+            "INSERT INTO pipeline_dependencies (pipeline_id, depends_on_id) VALUES (%s, %s)",
+            (pipeline_id, dep_id)
+        )
+
+    return {"id": pipeline_id, "message": "Pipeline created", "dag_id": dag_id}
+
+@app.delete("/pipelines/{pipeline_id}")
+def delete_pipeline(pipeline_id: int):
+    query("UPDATE pipelines SET is_active = false WHERE id = %s", (pipeline_id,))
+    return {"message": "Pipeline deleted"}
+
+# ─── Job Runs ─────────────────────────────────────────────────────────
+@app.get("/pipelines/{pipeline_id}/runs")
+def get_runs(pipeline_id: int, limit: int = 30):
+    rows = query(
+        "SELECT * FROM job_runs WHERE pipeline_id = %s ORDER BY started_at DESC LIMIT %s",
+        (pipeline_id, limit)
+    )
+    return [dict(r) for r in rows]
+
+@app.post("/pipelines/{pipeline_id}/trigger")
+def trigger_pipeline(pipeline_id: int):
+    pipeline_rows = query("SELECT * FROM pipelines WHERE id = %s", (pipeline_id,))
+    if not pipeline_rows:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    pipeline = dict(pipeline_rows[0])
+
+    conn_rows = query("SELECT * FROM connections WHERE id = %s", (pipeline['connection_id'],))
+    if not conn_rows:
+        raise HTTPException(status_code=404, detail="Source connection not found")
+    src_conn = dict(conn_rows[0])
+
+    # Resolve destination connection (if any)
+    dest_conn = None
+    if pipeline.get('destination_connection_id'):
+        dest_rows = query("SELECT * FROM connections WHERE id = %s", (pipeline['destination_connection_id'],))
+        if dest_rows:
+            dest_conn = dict(dest_rows[0])
+
+    run_rows = query(
+        """INSERT INTO job_runs (pipeline_id, status, started_at, phase_completed)
+           VALUES (%s, 'running', NOW(), 0) RETURNING id""",
+        (pipeline_id,)
+    )
+    run_id = run_rows[0]['id']
+
+    try:
+        # ── Phase 1: Extract ──────────────────────────────────────────
+        query("UPDATE job_runs SET phase_completed = 1 WHERE id = %s", (run_id,))
+
+        src = get_source_db(
+            host=src_conn["host"], port=src_conn["port"],
+            dbname=src_conn["db_name"], user=src_conn["db_user"],
+            password=src_conn["db_password"]
+        )
+
+        last_runs = query(
+            """SELECT MAX(ended_at) as last_run FROM job_runs
+               WHERE pipeline_id = %s AND status = 'complete'""",
+            (pipeline_id,)
+        )
+        last_watermark = (
+            last_runs[0]['last_run']
+            if last_runs and last_runs[0]['last_run']
+            else datetime.now() - timedelta(days=30)
+        )
+
+        with src.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            watermark_col = pipeline.get('watermark_column') or 'updated_at'
+            try:
+                cur.execute(
+                    f"SELECT * FROM {pipeline['source_table']} WHERE {watermark_col} >= %s",
+                    (last_watermark,)
+                )
+                extracted_rows = cur.fetchall()
+            except Exception:
+                cur.execute(f"SELECT * FROM {pipeline['source_table']}")
+                extracted_rows = cur.fetchall()
+
+            # Fetch column definitions from source
+            cur.execute("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = %s AND table_schema = 'public'
+                ORDER BY ordinal_position
+            """, (pipeline['source_table'],))
+            col_defs = cur.fetchall()
+
+        src.close()
+
+        rows_extracted = len(extracted_rows)
+
+        # ── Phase 2: Load ─────────────────────────────────────────────
+        query("UPDATE job_runs SET phase_completed = 2 WHERE id = %s", (run_id,))
+
+        if extracted_rows:
+            if dest_conn and dest_conn['db_type'] == 'snowflake':
+                _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows)
+            else:
+                _load_to_mock_postgres(pipeline, col_defs, extracted_rows)
+
+        # ── Volume anomaly check ──────────────────────────────────────
+        history = query(
+            """SELECT rows_loaded FROM job_runs
+               WHERE pipeline_id = %s AND status = 'complete'
+               ORDER BY started_at DESC LIMIT 7""",
+            (pipeline_id,)
+        )
+        anomaly = False
+        if history:
+            avg = sum(r['rows_loaded'] or 0 for r in history) / len(history)
+            upper = pipeline.get('volume_alert_upper_pct', 200)
+            lower = pipeline.get('volume_alert_lower_pct', 50)
+            if avg > 0:
+                pct = (rows_extracted / avg) * 100
+                anomaly = pct < lower or pct > upper
+
+        query(
+            """UPDATE job_runs SET status = 'complete', phase_completed = 3,
+               ended_at = NOW(), rows_loaded = %s, volume_anomaly_flag = %s
+               WHERE id = %s""",
+            (rows_extracted, anomaly, run_id)
+        )
+
+        return {
+            "run_id": run_id,
+            "status": "complete",
+            "rows_loaded": rows_extracted,
+            "volume_anomaly": anomaly
+        }
+
+    except Exception as e:
+        query(
+            "UPDATE job_runs SET status = 'failed', ended_at = NOW(), error_message = %s WHERE id = %s",
+            (str(e), run_id)
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Load helpers ─────────────────────────────────────────────────────
+
+TYPE_MAP = {
+    'integer': 'INTEGER', 'bigint': 'BIGINT', 'serial': 'INTEGER',
+    'varchar': 'VARCHAR(500)', 'character varying': 'VARCHAR(500)',
+    'text': 'TEXT', 'boolean': 'BOOLEAN',
+    'numeric': 'NUMERIC(18,4)', 'decimal': 'NUMERIC(18,4)',
+    'timestamp without time zone': 'TIMESTAMP',
+    'timestamp with time zone': 'TIMESTAMP_TZ',
+    'date': 'DATE', 'double precision': 'FLOAT',
+}
+
+def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
+    sf = get_snowflake_conn(dest_conn)
+    target_schema = (pipeline.get('target_schema_name') or 'ELT_STAGING').upper()
+    target_table = pipeline['target_table'].upper()
+    merge_key = (pipeline.get('merge_key_column') or 'id').lower()
+
+    col_sql = ", ".join([
+        f"{c['column_name']} {TYPE_MAP.get(c['data_type'], 'TEXT')}"
+        for c in col_defs
+    ])
+    cols = [c['column_name'] for c in col_defs]
+    col_names = ", ".join(cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+
+    with sf.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {target_schema}")
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {target_schema}.{target_table} ({col_sql})")
+
+        for row in extracted_rows:
+            vals = [row[c] for c in cols]
+            # DELETE + INSERT acts as upsert for Snowflake staging tables
+            cur.execute(
+                f"DELETE FROM {target_schema}.{target_table} WHERE {merge_key} = %s",
+                (row[merge_key],)
+            )
+            cur.execute(
+                f"INSERT INTO {target_schema}.{target_table} ({col_names}) VALUES ({placeholders})",
+                vals
+            )
+
+    sf.commit()
+    sf.close()
+
+
+def _load_to_mock_postgres(pipeline, col_defs, extracted_rows):
+    """Fallback: load into the local mock postgres snowflake_target schema."""
+    from contextlib import suppress
+    mock = get_db()
+    target_schema = 'snowflake_target'
+    target_table = pipeline['target_table']
+    merge_key = pipeline.get('merge_key_column') or 'id'
+
+    col_sql = ", ".join([
+        f"{c['column_name']} {TYPE_MAP.get(c['data_type'], 'TEXT')}"
+        for c in col_defs
+    ])
+    cols = [c['column_name'] for c in col_defs]
+    col_names = ", ".join(cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+    update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in cols if c != merge_key])
+
+    with mock.cursor() as cur:
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {target_schema}.{target_table} ({col_sql})")
+        for row in extracted_rows:
+            vals = [row[c] for c in cols]
+            cur.execute(f"""
+                INSERT INTO {target_schema}.{target_table} ({col_names})
+                VALUES ({placeholders})
+                ON CONFLICT ({merge_key}) DO UPDATE SET {update_set}
+            """, vals)
+
+    mock.commit()
+    mock.close()
+
+
+# ─── Dashboard stats ──────────────────────────────────────────────────
+@app.get("/stats")
+def get_stats():
+    pipelines = query("SELECT COUNT(*) as count FROM pipelines WHERE is_active = true")
+    connections = query("SELECT COUNT(*) as count FROM connections WHERE is_active = true")
+    runs_today = query("""
+        SELECT COUNT(*) as count FROM job_runs
+        WHERE started_at >= NOW() - INTERVAL '24 hours'
+    """)
+    failed_today = query("""
+        SELECT COUNT(*) as count FROM job_runs
+        WHERE started_at >= NOW() - INTERVAL '24 hours' AND status = 'failed'
+    """)
+    anomalies = query("""
+        SELECT COUNT(*) as count FROM job_runs
+        WHERE volume_anomaly_flag = true AND started_at >= NOW() - INTERVAL '7 days'
+    """)
+
+    return {
+        "total_pipelines": pipelines[0]['count'],
+        "total_connections": connections[0]['count'],
+        "runs_today": runs_today[0]['count'],
+        "failed_today": failed_today[0]['count'],
+        "anomalies_7d": anomalies[0]['count']
+    }
+
+@app.get("/pipelines/{pipeline_id}/volume-history")
+def volume_history(pipeline_id: int):
+    rows = query("""
+        SELECT DATE(started_at) as run_date,
+               SUM(rows_loaded) as rows_loaded,
+               COUNT(*) as run_count,
+               MAX(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as had_failure,
+               MAX(CASE WHEN volume_anomaly_flag = true THEN 1 ELSE 0 END) as had_anomaly
+        FROM job_runs
+        WHERE pipeline_id = %s AND started_at >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(started_at)
+        ORDER BY run_date ASC
+    """, (pipeline_id,))
+    return [dict(r) for r in rows]
+
+@app.get("/dependencies")
+def get_all_dependencies():
+    rows = query("""
+        SELECT pd.pipeline_id, p1.name as pipeline_name,
+               pd.depends_on_id, p2.name as depends_on_name
+        FROM pipeline_dependencies pd
+        JOIN pipelines p1 ON pd.pipeline_id = p1.id
+        JOIN pipelines p2 ON pd.depends_on_id = p2.id
+    """)
+    return [dict(r) for r in rows]
