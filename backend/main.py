@@ -520,6 +520,8 @@ def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     placeholders = ", ".join(["%s"] * len(cols))
 
     with sf.cursor() as cur:
+        if dest_conn.get('snowflake_warehouse'):
+            cur.execute(f"USE WAREHOUSE {dest_conn['snowflake_warehouse']}")
         cur.execute(f"CREATE TABLE IF NOT EXISTS {full_table} ({col_sql})")
 
         for row in extracted_rows:
