@@ -7,4 +7,5 @@ pydantic-settings==2.1.0
 boto3==1.34.0
 httpx==0.26.0
 python-multipart==0.0.6
-snowflake-connector-python==3.6.0
+snowflake-connector-python[pandas]==3.6.0
+pyarrow==14.0.2

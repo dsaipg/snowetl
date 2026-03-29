@@ -504,33 +504,57 @@ TYPE_MAP = {
 }
 
 def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
-    sf = get_snowflake_conn(dest_conn)
+    import pandas as pd
+    from snowflake.connector.pandas_tools import write_pandas
+
     database = (pipeline.get('target_database') or dest_conn['db_name']).upper()
     target_schema = (pipeline.get('target_schema_name') or dest_conn.get('snowflake_schema') or 'PUBLIC').upper()
     target_table = pipeline['target_table'].upper()
-    full_table = f"{database}.{target_schema}.{target_table}"
     merge_key = (pipeline.get('merge_key_column') or 'id').lower()
 
-    col_sql = ", ".join([
-        f"{c['column_name']} {TYPE_MAP.get(c['data_type'], 'TEXT')}"
-        for c in col_defs
-    ])
+    # Build DataFrame from extracted rows
     cols = [c['column_name'] for c in col_defs]
-    col_names = ", ".join(cols)
-    placeholders = ", ".join(["%s"] * len(cols))
+    df = pd.DataFrame([{c: row[c] for c in cols} for row in extracted_rows])
+    df.columns = [c.upper() for c in df.columns]
+    merge_key_upper = merge_key.upper()
+
+    sf = get_snowflake_conn(dest_conn)
 
     with sf.cursor() as cur:
         if dest_conn.get('snowflake_warehouse'):
             cur.execute(f"USE WAREHOUSE {dest_conn['snowflake_warehouse']}")
-        cur.execute(f"CREATE TABLE IF NOT EXISTS {full_table} ({col_sql})")
 
-        for row in extracted_rows:
-            vals = [row[c] for c in cols]
-            cur.execute(f"DELETE FROM {full_table} WHERE {merge_key} = %s", (row[merge_key],))
-            cur.execute(f"INSERT INTO {full_table} ({col_names}) VALUES ({placeholders})", vals)
+        # Create table if not exists
+        col_sql = ", ".join([
+            f"{c['column_name'].upper()} {TYPE_MAP.get(c['data_type'], 'TEXT')}"
+            for c in col_defs
+        ])
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {database}.{target_schema}.{target_table} ({col_sql})")
 
-    sf.commit()
+        # Delete existing rows matching merge key (upsert pattern)
+        if merge_key_upper in df.columns:
+            keys = df[merge_key_upper].tolist()
+            placeholders = ','.join(['%s'] * len(keys))
+            cur.execute(
+                f"DELETE FROM {database}.{target_schema}.{target_table} WHERE {merge_key_upper} IN ({placeholders})",
+                keys
+            )
+
+    # write_pandas: Parquet → internal stage → COPY INTO (bulk, parallel-safe)
+    success, nchunks, nrows, _ = write_pandas(
+        conn=sf,
+        df=df,
+        table_name=target_table,
+        database=database,
+        schema=target_schema,
+        auto_create_table=False,
+        overwrite=False,
+    )
+
     sf.close()
+
+    if not success:
+        raise Exception(f"write_pandas failed: {nchunks} chunks, {nrows} rows")
 
 
 def _load_to_mock_postgres(pipeline, col_defs, extracted_rows):
