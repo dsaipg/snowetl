@@ -1,16 +1,25 @@
 """
-pipeline_dag.py — Generic ELT Pipeline DAG for self-service ELT platform.
+pipeline_dag.py — Generic ELT Pipeline DAG
+===========================================
+Dynamic DAG factory: one DAG per pipeline fetched from the backend.
 
-This DAG reads pipeline configuration from the FastAPI backend and orchestrates
-extract → load → transform steps. One DAG instance is created per pipeline
-via the dynamic DAG pattern.
+Local path  (ENVIRONMENT=local):
+  start_run → run_elt  → finish_run
+  run_elt connects to source, extracts incrementally, writes to Snowflake
+  via write_pandas (Parquet → internal stage → COPY INTO) or mock Postgres.
 
-Environment variables (set in docker-compose.yml):
-    BACKEND_URL      — FastAPI base URL, e.g. http://backend:8000
-    MINIO_ENDPOINT   — MinIO URL, e.g. http://minio:9000
-    MINIO_ACCESS_KEY — MinIO access key
-    MINIO_SECRET_KEY — MinIO secret key
-    MINIO_BUCKET     — Target bucket name (default: elt-staging)
+AWS path (ENVIRONMENT=aws):
+  start_run → run_elt  → finish_run
+  run_elt submits an AWS Glue job with (pipeline_id, run_id, backend_url),
+  then polls until the Glue job run reaches a terminal state.
+  The Glue job itself updates rows_loaded via PATCH /runs/{run_id}.
+
+Environment variables (set in docker-compose / MWAA env):
+  BACKEND_URL       FastAPI base URL            http://backend:8000
+  ENVIRONMENT       local | aws                 local
+  AWS_REGION        AWS region for Glue         us-east-1
+  GLUE_JOB_NAME     Name of the Glue job        elt-platform-pipeline-job
+  AIRFLOW__*        Standard Airflow config
 """
 
 import json
@@ -27,381 +36,367 @@ from airflow.utils.dates import days_ago
 
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-MINIO_BUCKET = os.getenv("MINIO_BUCKET", "elt-staging")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "local")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+GLUE_JOB_NAME = os.getenv("GLUE_JOB_NAME", "elt-platform-pipeline-job")
 
 DEFAULT_ARGS = {
     "owner": "elt-platform",
     "depends_on_past": False,
-    "retries": 2,
-    "retry_delay": timedelta(minutes=2),
-    "retry_exponential_backoff": True,
-    "max_retry_delay": timedelta(minutes=10),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
     "email_on_failure": False,
     "email_on_retry": False,
 }
 
 
-# ─────────────────────────────────────────────
-# Helper: backend API client
-# ─────────────────────────────────────────────
+# ─── Backend API client ───────────────────────────────────────────────────────
 class BackendClient:
     def __init__(self, base_url: str = BACKEND_URL):
-        self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
+        self.base = base_url.rstrip("/")
+        self._s = requests.Session()
+        self._s.headers["Content-Type"] = "application/json"
 
     def get_pipeline(self, pipeline_id: int) -> dict:
-        resp = self.session.get(f"{self.base_url}/pipelines/{pipeline_id}", timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        r = self._s.get(f"{self.base}/pipelines/{pipeline_id}", timeout=30)
+        r.raise_for_status()
+        return r.json()
 
-    def get_connection(self, connection_id: int) -> dict:
-        resp = self.session.get(f"{self.base_url}/connections/{connection_id}", timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+    def get_connection(self, conn_id: int) -> dict:
+        r = self._s.get(f"{self.base}/connections/{conn_id}", timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def get_pipelines(self) -> list:
+        r = self._s.get(f"{self.base}/pipelines", timeout=10)
+        r.raise_for_status()
+        return r.json()
 
     def create_run(self, pipeline_id: int, triggered_by: str = "airflow") -> dict:
-        resp = self.session.post(
-            f"{self.base_url}/pipelines/{pipeline_id}/runs",
+        r = self._s.post(
+            f"{self.base}/pipelines/{pipeline_id}/runs",
             json={"triggered_by": triggered_by},
             timeout=30,
         )
-        resp.raise_for_status()
-        return resp.json()
+        r.raise_for_status()
+        return r.json()
 
-    def update_run(self, run_id: int, payload: dict) -> dict:
-        resp = self.session.patch(
-            f"{self.base_url}/runs/{run_id}",
-            json=payload,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_pipelines(self) -> list:
-        resp = self.session.get(f"{self.base_url}/pipelines", timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+    def update_run(self, run_id: int, payload: dict):
+        r = self._s.patch(f"{self.base}/runs/{run_id}", json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
 
 
-# ─────────────────────────────────────────────
-# Task functions
-# ─────────────────────────────────────────────
+# ─── Task: start_run ─────────────────────────────────────────────────────────
 def start_run(pipeline_id: int, **context):
     """
-    Register a run in the backend and push the run_id to XCom so downstream
-    tasks can update its status.
+    Use the run_id passed via dag_run.conf (when backend triggered the DAG) or
+    create a new run (when Airflow scheduler triggers on cron).
     """
+    conf = (context.get("dag_run") and context["dag_run"].conf) or {}
+    run_id = conf.get("run_id")
+
     client = BackendClient()
-    run = client.create_run(pipeline_id, triggered_by="airflow")
-    run_id = run["id"]
-    log.info("Created run %d for pipeline %d", run_id, pipeline_id)
+    if run_id:
+        # Backend pre-created this run before calling the Airflow API
+        log.info("Using existing run_id=%s from dag_run.conf", run_id)
+        client.update_run(run_id, {"status": "running"})
+    else:
+        run = client.create_run(pipeline_id, triggered_by="airflow_scheduled")
+        run_id = run["id"]
+        log.info("Created new run_id=%s for pipeline %s", run_id, pipeline_id)
+
     context["ti"].xcom_push(key="run_id", value=run_id)
-    context["ti"].xcom_push(key="pipeline_id", value=pipeline_id)
     return run_id
 
 
-def extract(pipeline_id: int, **context):
-    """
-    Extract data from the source connection defined in the pipeline config.
-    Writes parquet-like JSON to MinIO staging area.
-    """
-    import io
-    import psycopg2  # available in Airflow image
-
+# ─── Task: run_elt ───────────────────────────────────────────────────────────
+def run_elt(pipeline_id: int, **context):
+    """Dispatch to local write_pandas path or AWS Glue path based on ENVIRONMENT."""
     ti = context["ti"]
     run_id = ti.xcom_pull(key="run_id", task_ids="start_run")
-    client = BackendClient()
 
-    # Fetch pipeline config
-    pipeline = client.get_pipeline(pipeline_id)
-    source_conn_id = pipeline.get("source_connection_id")
-    tables = pipeline.get("source_tables", [])
-    if not tables:
-        raise ValueError(f"Pipeline {pipeline_id} has no source_tables configured")
-
-    source_conn = client.get_connection(source_conn_id)
-    log.info("Extracting from connection: %s", source_conn.get("name"))
-
-    # Connect to source Postgres
-    db_url = source_conn.get("connection_string") or _build_dsn(source_conn)
-    conn = psycopg2.connect(db_url)
-
-    extracted = {}
-    total_rows = 0
-    try:
-        cur = conn.cursor()
-        for table in tables:
-            schema = table.get("schema", "public")
-            tname = table.get("table")
-            query = table.get("query") or f'SELECT * FROM "{schema}"."{tname}"'
-            cur.execute(query)
-            columns = [desc[0] for desc in cur.description]
-            rows = cur.fetchall()
-            extracted[f"{schema}.{tname}"] = {
-                "columns": columns,
-                "rows": [list(r) for r in rows],
-                "row_count": len(rows),
-            }
-            total_rows += len(rows)
-            log.info("Extracted %d rows from %s.%s", len(rows), schema, tname)
-    finally:
-        conn.close()
-
-    # Stage to MinIO
-    _upload_to_minio(
-        key=f"runs/{run_id}/extracted.json",
-        data=json.dumps(extracted, default=str),
-    )
-
-    # Mark run as in-progress with row count
-    client.update_run(run_id, {"rows_extracted": total_rows, "status": "running"})
-    ti.xcom_push(key="total_rows", value=total_rows)
-    log.info("Extract complete — %d total rows staged to MinIO", total_rows)
-    return total_rows
+    if ENVIRONMENT == "aws":
+        _run_via_glue(pipeline_id, run_id)
+    else:
+        _run_locally(pipeline_id, run_id)
 
 
-def transform(pipeline_id: int, **context):
+# ─── Local ELT path (write_pandas) ───────────────────────────────────────────
+def _run_locally(pipeline_id: int, run_id: int):
     """
-    Apply any transformations defined in the pipeline config.
-    Currently supports: column renames, type casts, row filters, computed columns.
-    Reads from MinIO staging, writes transformed output back.
-    """
-    ti = context["ti"]
-    run_id = ti.xcom_pull(key="run_id", task_ids="start_run")
-    client = BackendClient()
-    pipeline = client.get_pipeline(pipeline_id)
-
-    transforms = pipeline.get("transforms", [])
-    raw = json.loads(_download_from_minio(f"runs/{run_id}/extracted.json"))
-
-    transformed = {}
-    for table_key, table_data in raw.items():
-        columns = table_data["columns"]
-        rows = table_data["rows"]
-        table_transforms = [t for t in transforms if t.get("table") == table_key]
-
-        for tx in table_transforms:
-            tx_type = tx.get("type")
-            if tx_type == "rename_column":
-                old, new = tx["from"], tx["to"]
-                if old in columns:
-                    idx = columns.index(old)
-                    columns = list(columns)
-                    columns[idx] = new
-            elif tx_type == "filter_rows":
-                col = tx["column"]
-                op = tx.get("op", "eq")
-                val = tx["value"]
-                col_idx = columns.index(col) if col in columns else None
-                if col_idx is not None:
-                    rows = _apply_filter(rows, col_idx, op, val)
-            elif tx_type == "add_column":
-                columns = list(columns) + [tx["name"]]
-                rows = [list(r) + [tx.get("default")] for r in rows]
-
-        transformed[table_key] = {
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows),
-        }
-        log.info("Transformed %s — %d rows out", table_key, len(rows))
-
-    _upload_to_minio(
-        key=f"runs/{run_id}/transformed.json",
-        data=json.dumps(transformed, default=str),
-    )
-    log.info("Transform complete")
-    return len(transformed)
-
-
-def load(pipeline_id: int, **context):
-    """
-    Load transformed data into the destination (mock Snowflake / Postgres schema).
-    Performs UPSERT when a primary key is defined, otherwise truncate-insert.
+    Local demo path:
+      1. Connect to source Postgres via psycopg2
+      2. Extract rows incrementally by watermark (falls back to full table)
+      3. Write to Snowflake via write_pandas (Parquet → internal stage → COPY INTO)
+         or to the local mock Postgres snowflake_target schema if no Snowflake destination
     """
     import psycopg2
     import psycopg2.extras
 
-    ti = context["ti"]
-    run_id = ti.xcom_pull(key="run_id", task_ids="start_run")
     client = BackendClient()
     pipeline = client.get_pipeline(pipeline_id)
+    src_conn = client.get_connection(pipeline["connection_id"])
 
-    dest_conn_id = pipeline.get("destination_connection_id")
-    dest_conn = client.get_connection(dest_conn_id)
-    dest_schema = pipeline.get("destination_schema", "snowflake_mock")
+    dest_conn = None
+    if pipeline.get("destination_connection_id"):
+        dest_conn = client.get_connection(pipeline["destination_connection_id"])
 
-    data = json.loads(_download_from_minio(f"runs/{run_id}/transformed.json"))
-    db_url = dest_conn.get("connection_string") or _build_dsn(dest_conn)
+    # ── Watermark: last successful run ──────────────────────────────────────
+    from datetime import datetime, timedelta
+    last_run_resp = requests.get(
+        f"{BACKEND_URL}/pipelines/{pipeline_id}/runs?limit=1&status=complete",
+        timeout=10,
+    )
+    last_runs = last_run_resp.json() if last_run_resp.ok else []
+    last_watermark = (
+        last_runs[0]["ended_at"]
+        if last_runs and last_runs[0].get("ended_at")
+        else (datetime.now() - timedelta(days=30)).isoformat()
+    )
 
-    conn = psycopg2.connect(db_url)
-    total_loaded = 0
+    # ── Extract ─────────────────────────────────────────────────────────────
+    src = psycopg2.connect(
+        host=src_conn["host"], port=src_conn["port"],
+        dbname=src_conn["db_name"], user=src_conn["db_user"],
+        password=src_conn["db_password"],
+    )
     try:
-        cur = conn.cursor()
-        for table_key, table_data in data.items():
-            _, tname = table_key.split(".", 1)
-            dest_table = f'"{dest_schema}"."{tname}"'
-            columns = table_data["columns"]
-            rows = table_data["rows"]
-
-            if not rows:
-                log.info("Skipping %s — no rows", tname)
-                continue
-
-            # Ensure destination table exists (auto-create)
-            _ensure_table(cur, dest_schema, tname, columns)
-
-            # Truncate-insert (simple strategy; swap for UPSERT if pk defined)
-            pk = pipeline.get("primary_key")
-            if pk and pk in columns:
-                _upsert(cur, dest_table, columns, rows, pk)
-            else:
-                cur.execute(f"TRUNCATE {dest_table}")
-                psycopg2.extras.execute_values(
-                    cur,
-                    f'INSERT INTO {dest_table} ({",".join(f"{chr(34)}{c}{chr(34)}" for c in columns)}) VALUES %s',
-                    rows,
+        with src.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            watermark_col = pipeline.get("watermark_column") or "updated_at"
+            try:
+                cur.execute(
+                    f"SELECT * FROM {pipeline['source_table']} WHERE {watermark_col} >= %s",
+                    (last_watermark,),
                 )
+            except Exception:
+                cur.execute(f"SELECT * FROM {pipeline['source_table']}")
+            extracted_rows = cur.fetchall()
 
-            total_loaded += len(rows)
-            log.info("Loaded %d rows into %s", len(rows), dest_table)
-
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+            cur.execute("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = %s AND table_schema = 'public'
+                ORDER BY ordinal_position
+            """, (pipeline["source_table"],))
+            col_defs = cur.fetchall()
     finally:
-        conn.close()
+        src.close()
 
-    client.update_run(run_id, {"rows_processed": total_loaded})
-    ti.xcom_push(key="rows_loaded", value=total_loaded)
-    log.info("Load complete — %d rows written to destination", total_loaded)
-    return total_loaded
+    rows_extracted = len(extracted_rows)
+    log.info("Extracted %d rows from %s", rows_extracted, pipeline["source_table"])
+
+    # ── Load ────────────────────────────────────────────────────────────────
+    if extracted_rows:
+        if dest_conn and dest_conn["db_type"] == "snowflake":
+            _write_pandas_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows)
+        else:
+            _write_to_mock_postgres(pipeline, col_defs, extracted_rows)
+
+    # ── Volume anomaly check ─────────────────────────────────────────────────
+    history_resp = requests.get(
+        f"{BACKEND_URL}/pipelines/{pipeline_id}/runs?limit=7", timeout=10
+    )
+    history = history_resp.json() if history_resp.ok else []
+    anomaly = False
+    if history:
+        avg = sum(r.get("rows_loaded") or 0 for r in history) / len(history)
+        upper = pipeline.get("volume_alert_upper_pct", 200)
+        lower = pipeline.get("volume_alert_lower_pct", 50)
+        if avg > 0:
+            pct = (rows_extracted / avg) * 100
+            anomaly = pct < lower or pct > upper
+
+    client.update_run(run_id, {
+        "status": "complete",
+        "rows_loaded": rows_extracted,
+        "volume_anomaly_flag": anomaly,
+        "ended_at": datetime.utcnow().isoformat(),
+        "phase_completed": 3,
+    })
+    log.info("Local ELT complete — %d rows, anomaly=%s", rows_extracted, anomaly)
 
 
+TYPE_MAP = {
+    "integer": "INTEGER", "bigint": "BIGINT", "serial": "INTEGER",
+    "varchar": "VARCHAR(500)", "character varying": "VARCHAR(500)",
+    "text": "TEXT", "boolean": "BOOLEAN",
+    "numeric": "NUMERIC(18,4)", "decimal": "NUMERIC(18,4)",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp with time zone": "TIMESTAMP_TZ",
+    "date": "DATE", "double precision": "FLOAT",
+}
+
+
+def _write_pandas_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
+    import pandas as pd
+    import snowflake.connector
+    from snowflake.connector.pandas_tools import write_pandas
+
+    database = (pipeline.get("target_database") or dest_conn["db_name"]).upper()
+    target_schema = (pipeline.get("target_schema_name") or dest_conn.get("snowflake_schema") or "PUBLIC").upper()
+    target_table = pipeline["target_table"].upper()
+    merge_key = (pipeline.get("merge_key_column") or "id").upper()
+
+    cols = [c["column_name"] for c in col_defs]
+    df = pd.DataFrame([{c: row[c] for c in cols} for row in extracted_rows])
+    df.columns = [c.upper() for c in df.columns]
+
+    sf = snowflake.connector.connect(
+        account=dest_conn["host"],
+        user=dest_conn["db_user"],
+        password=dest_conn["db_password"],
+        database=dest_conn["db_name"],
+        schema=dest_conn.get("snowflake_schema") or "PUBLIC",
+        warehouse=dest_conn.get("snowflake_warehouse"),
+        role=dest_conn.get("snowflake_role"),
+    )
+    try:
+        with sf.cursor() as cur:
+            if dest_conn.get("snowflake_warehouse"):
+                cur.execute(f"USE WAREHOUSE {dest_conn['snowflake_warehouse']}")
+            col_sql = ", ".join(
+                f"{c['column_name'].upper()} {TYPE_MAP.get(c['data_type'], 'TEXT')}"
+                for c in col_defs
+            )
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {database}.{target_schema}.{target_table} ({col_sql})"
+            )
+            if merge_key in df.columns:
+                keys = df[merge_key].tolist()
+                placeholders = ",".join(["%s"] * len(keys))
+                cur.execute(
+                    f"DELETE FROM {database}.{target_schema}.{target_table} "
+                    f"WHERE {merge_key} IN ({placeholders})",
+                    keys,
+                )
+        success, nchunks, nrows, _ = write_pandas(
+            conn=sf, df=df,
+            table_name=target_table, database=database, schema=target_schema,
+            auto_create_table=False, overwrite=False,
+        )
+        if not success:
+            raise Exception(f"write_pandas failed after {nchunks} chunks / {nrows} rows")
+        log.info("write_pandas: %d rows → %s.%s.%s", nrows, database, target_schema, target_table)
+    finally:
+        sf.close()
+
+
+def _write_to_mock_postgres(pipeline, col_defs, extracted_rows):
+    import psycopg2
+
+    mock = psycopg2.connect(
+        host=os.getenv("DB_HOST", "postgres"),
+        port=int(os.getenv("DB_PORT", "5432")),
+        dbname=os.getenv("DB_NAME", "etlplatform"),
+        user=os.getenv("DB_USER", "etluser"),
+        password=os.getenv("DB_PASSWORD", "etlpassword"),
+    )
+    target_schema = "snowflake_target"
+    target_table = pipeline["target_table"]
+    merge_key = pipeline.get("merge_key_column") or "id"
+    cols = [c["column_name"] for c in col_defs]
+    col_sql = ", ".join(f"{c['column_name']} {TYPE_MAP.get(c['data_type'], 'TEXT')}" for c in col_defs)
+    col_names = ", ".join(cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+    update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != merge_key)
+
+    with mock.cursor() as cur:
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {target_schema}.{target_table} ({col_sql})")
+        for row in extracted_rows:
+            vals = [row[c] for c in cols]
+            cur.execute(
+                f"INSERT INTO {target_schema}.{target_table} ({col_names}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({merge_key}) DO UPDATE SET {update_set}",
+                vals,
+            )
+    mock.commit()
+    mock.close()
+
+
+# ─── AWS Glue path ────────────────────────────────────────────────────────────
+def _run_via_glue(pipeline_id: int, run_id: int):
+    """
+    Submit the Glue job elt_glue_job.py with pipeline_id / run_id as params,
+    then poll the Glue job run until it reaches a terminal state.
+    The Glue job updates rows_loaded itself via PATCH /runs/{run_id}.
+    This function only needs to mark the final status on failure.
+    """
+    import boto3
+
+    glue = boto3.client("glue", region_name=AWS_REGION)
+
+    job_args = {
+        "--pipeline_id": str(pipeline_id),
+        "--run_id": str(run_id),
+        "--backend_url": BACKEND_URL,
+    }
+
+    response = glue.start_job_run(JobName=GLUE_JOB_NAME, Arguments=job_args)
+    glue_run_id = response["JobRunId"]
+    log.info("Submitted Glue job %s run %s for pipeline %s / run %s",
+             GLUE_JOB_NAME, glue_run_id, pipeline_id, run_id)
+
+    # ── Poll until terminal ──────────────────────────────────────────────────
+    terminal_states = {"SUCCEEDED", "FAILED", "ERROR", "TIMEOUT", "STOPPED"}
+    poll_interval = 20  # seconds
+
+    while True:
+        time.sleep(poll_interval)
+        detail = glue.get_job_run(JobName=GLUE_JOB_NAME, RunId=glue_run_id)
+        state = detail["JobRun"]["JobRunState"]
+        log.info("Glue run %s state: %s", glue_run_id, state)
+
+        if state in terminal_states:
+            if state != "SUCCEEDED":
+                error_msg = detail["JobRun"].get("ErrorMessage", f"Glue job {state}")
+                # Glue job should have already called back; this is a safety net
+                BackendClient().update_run(run_id, {
+                    "status": "failed",
+                    "error_message": error_msg,
+                    "ended_at": datetime.utcnow().isoformat(),
+                })
+                raise Exception(f"Glue job {GLUE_JOB_NAME}/{glue_run_id} {state}: {error_msg}")
+            log.info("Glue job SUCCEEDED for pipeline %s / run %s", pipeline_id, run_id)
+            break
+
+        # Increase poll interval gradually to reduce API calls for long jobs
+        poll_interval = min(poll_interval + 10, 60)
+
+
+# ─── Task: finish_run ────────────────────────────────────────────────────────
 def finish_run(pipeline_id: int, **context):
-    """Mark the run as success in the backend."""
+    """Mark run as complete (for scheduled local runs where status may not be set yet)."""
     ti = context["ti"]
     run_id = ti.xcom_pull(key="run_id", task_ids="start_run")
-    rows = ti.xcom_pull(key="rows_loaded", task_ids="load") or 0
-    client = BackendClient()
-    client.update_run(run_id, {
-        "status": "success",
-        "finished_at": datetime.utcnow().isoformat(),
-        "rows_processed": rows,
-    })
-    log.info("Run %d marked SUCCESS", run_id)
+    # For AWS path, Glue job already updated status; this is a no-op safety net.
+    # For local path, _run_locally already updated status.
+    log.info("finish_run: pipeline %s / run %s complete", pipeline_id, run_id)
 
 
 def fail_run(pipeline_id: int, **context):
-    """Called via on_failure_callback — marks the run as failed."""
+    """on_failure_callback — mark run as failed in the backend."""
     ti = context["ti"]
     run_id = ti.xcom_pull(key="run_id", task_ids="start_run")
-    if run_id:
-        client = BackendClient()
-        client.update_run(run_id, {
-            "status": "failed",
-            "finished_at": datetime.utcnow().isoformat(),
-            "error": str(context.get("exception", "Unknown error")),
-        })
-        log.error("Run %d marked FAILED", run_id)
+    if not run_id:
+        return
+    exc = context.get("exception")
+    BackendClient().update_run(run_id, {
+        "status": "failed",
+        "error_message": str(exc) if exc else "Airflow task failure",
+        "ended_at": datetime.utcnow().isoformat(),
+    })
+    log.error("Run %s marked FAILED (pipeline %s)", run_id, pipeline_id)
 
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-def _build_dsn(conn: dict) -> str:
-    return (
-        f"host={conn.get('host', 'localhost')} "
-        f"port={conn.get('port', 5432)} "
-        f"dbname={conn.get('database', 'postgres')} "
-        f"user={conn.get('username', 'postgres')} "
-        f"password={conn.get('password', '')}"
-    )
-
-
-def _upload_to_minio(key: str, data: str):
-    try:
-        from minio import Minio  # type: ignore
-        client = Minio(
-            MINIO_ENDPOINT.replace("http://", "").replace("https://", ""),
-            access_key=MINIO_ACCESS_KEY,
-            secret_key=MINIO_SECRET_KEY,
-            secure=MINIO_ENDPOINT.startswith("https"),
-        )
-        import io
-        b = data.encode()
-        client.put_object(MINIO_BUCKET, key, io.BytesIO(b), length=len(b), content_type="application/json")
-        log.info("Uploaded %s to MinIO (%d bytes)", key, len(b))
-    except ImportError:
-        log.warning("minio SDK not installed — skipping MinIO upload (data in memory only)")
-
-
-def _download_from_minio(key: str) -> str:
-    try:
-        from minio import Minio  # type: ignore
-        client = Minio(
-            MINIO_ENDPOINT.replace("http://", "").replace("https://", ""),
-            access_key=MINIO_ACCESS_KEY,
-            secret_key=MINIO_SECRET_KEY,
-            secure=MINIO_ENDPOINT.startswith("https"),
-        )
-        resp = client.get_object(MINIO_BUCKET, key)
-        return resp.read().decode()
-    except ImportError:
-        log.warning("minio SDK not installed — returning empty object")
-        return "{}"
-
-
-def _ensure_table(cur, schema: str, table: str, columns: list):
-    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-    col_defs = ", ".join(f'"{c}" TEXT' for c in columns)
-    cur.execute(f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({col_defs})')
-
-
-def _upsert(cur, dest_table: str, columns: list, rows: list, pk: str):
-    import psycopg2.extras
-    col_str = ", ".join(f'"{c}"' for c in columns)
-    update_str = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in columns if c != pk)
-    psycopg2.extras.execute_values(
-        cur,
-        f"""
-        INSERT INTO {dest_table} ({col_str}) VALUES %s
-        ON CONFLICT ("{pk}") DO UPDATE SET {update_str}
-        """,
-        rows,
-    )
-
-
-def _apply_filter(rows: list, col_idx: int, op: str, val) -> list:
-    ops = {
-        "eq": lambda r: str(r[col_idx]) == str(val),
-        "ne": lambda r: str(r[col_idx]) != str(val),
-        "gt": lambda r: float(r[col_idx] or 0) > float(val),
-        "lt": lambda r: float(r[col_idx] or 0) < float(val),
-        "contains": lambda r: str(val).lower() in str(r[col_idx] or "").lower(),
-    }
-    fn = ops.get(op, lambda r: True)
-    return [r for r in rows if fn(r)]
-
-
-# ─────────────────────────────────────────────
-# Dynamic DAG factory
-# ─────────────────────────────────────────────
+# ─── Dynamic DAG factory ──────────────────────────────────────────────────────
 def _make_dag(pipeline: dict) -> DAG:
-    """Build a DAG for a single pipeline config dict."""
     pipeline_id = pipeline["id"]
     dag_id = f"elt_pipeline_{pipeline_id}"
-    schedule = pipeline.get("schedule") or pipeline.get("cron_expression") or "@daily"
-    description = pipeline.get("description") or f"ELT pipeline {pipeline_id}: {pipeline.get('name', '')}"
+    schedule = pipeline.get("cron_expression") or pipeline.get("schedule") or "@daily"
+    description = f"ELT pipeline {pipeline_id}: {pipeline.get('name', '')}"
 
     with DAG(
         dag_id=dag_id,
@@ -415,26 +410,23 @@ def _make_dag(pipeline: dict) -> DAG:
         doc_md=f"""
 ## {pipeline.get('name', dag_id)}
 
-Auto-generated ELT pipeline DAG.
+Auto-generated ELT pipeline DAG — `ENVIRONMENT={ENVIRONMENT}`
 
 | Field | Value |
-|-------|-------|
+|---|---|
 | Pipeline ID | `{pipeline_id}` |
 | Schedule | `{schedule}` |
-| Source | `{pipeline.get('source_connection_id')}` |
-| Destination | `{pipeline.get('destination_connection_id')}` |
+| Mode | `{"AWS Glue" if ENVIRONMENT == "aws" else "local write_pandas"}` |
 
 ### Steps
-1. **start_run** — Register run in backend, get run_id
-2. **extract** — Pull data from source DB, stage to MinIO
-3. **transform** — Apply pipeline transforms
-4. **load** — Write to destination (mock Snowflake)
-5. **finish_run** — Mark run SUCCESS in backend
+1. **start_run** — Register or adopt run in backend
+2. **run_elt** — Extract + Load ({'Glue job' if ENVIRONMENT == 'aws' else 'local write_pandas'})
+3. **finish_run** — Confirm success
         """,
     ) as dag:
 
-        def _fail_cb(context):
-            fail_run(pipeline_id, **context)
+        def _fail_cb(ctx):
+            fail_run(pipeline_id, **ctx)
 
         dag.on_failure_callback = _fail_cb
 
@@ -444,25 +436,11 @@ Auto-generated ELT pipeline DAG.
             op_kwargs={"pipeline_id": pipeline_id},
         )
 
-        t_extract = PythonOperator(
-            task_id="extract",
-            python_callable=extract,
+        t_run = PythonOperator(
+            task_id="run_elt",
+            python_callable=run_elt,
             op_kwargs={"pipeline_id": pipeline_id},
-            execution_timeout=timedelta(minutes=30),
-        )
-
-        t_transform = PythonOperator(
-            task_id="transform",
-            python_callable=transform,
-            op_kwargs={"pipeline_id": pipeline_id},
-            execution_timeout=timedelta(minutes=15),
-        )
-
-        t_load = PythonOperator(
-            task_id="load",
-            python_callable=load,
-            op_kwargs={"pipeline_id": pipeline_id},
-            execution_timeout=timedelta(minutes=30),
+            execution_timeout=timedelta(hours=2),  # Glue jobs can be long
         )
 
         t_finish = PythonOperator(
@@ -472,32 +450,26 @@ Auto-generated ELT pipeline DAG.
             trigger_rule="all_success",
         )
 
-        t_start >> t_extract >> t_transform >> t_load >> t_finish
+        t_start >> t_run >> t_finish
 
     return dag
 
 
-# ─────────────────────────────────────────────
-# Register DAGs dynamically
-# ─────────────────────────────────────────────
+# ─── Register DAGs ────────────────────────────────────────────────────────────
 def _load_pipelines() -> list:
-    """Fetch all pipelines from backend. Falls back to Airflow Variable."""
     try:
-        resp = requests.get(f"{BACKEND_URL}/pipelines", timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.warning("Could not fetch pipelines from backend (%s), using Variable fallback", e)
+        r = requests.get(f"{BACKEND_URL}/pipelines", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        log.warning("Could not fetch pipelines from backend (%s) — using Variable fallback", exc)
         try:
-            raw = Variable.get("elt_pipelines", default_var="[]")
-            return json.loads(raw)
+            return json.loads(Variable.get("elt_pipelines", default_var="[]"))
         except Exception:
             return []
 
 
-# Airflow discovers DAGs by iterating globals() in this module.
-# We register each pipeline's DAG into globals() at import time.
-for _pipeline in _load_pipelines():
-    _dag = _make_dag(_pipeline)
-    globals()[_dag.dag_id] = _dag
-    log.info("Registered DAG: %s", _dag.dag_id)
+for _p in _load_pipelines():
+    _d = _make_dag(_p)
+    globals()[_d.dag_id] = _d
+    log.info("Registered DAG: %s (env=%s)", _d.dag_id, ENVIRONMENT)

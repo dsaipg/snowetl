@@ -372,6 +372,48 @@ def get_runs(pipeline_id: int, limit: int = 30):
     )
     return [dict(r) for r in rows]
 
+class RunStatusUpdate(BaseModel):
+    status: Optional[str] = None
+    rows_loaded: Optional[int] = None
+    error_message: Optional[str] = None
+    volume_anomaly_flag: Optional[bool] = None
+    phase_completed: Optional[int] = None
+    ended_at: Optional[str] = None
+
+@app.patch("/runs/{run_id}")
+def update_run(run_id: int, body: RunStatusUpdate):
+    """
+    Update a job run's status, rows_loaded, error_message, etc.
+    Called by Airflow tasks and the Glue job callback.
+    """
+    existing = query("SELECT id FROM job_runs WHERE id = %s", (run_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    fields, vals = [], []
+    if body.status is not None:
+        fields.append("status = %s"); vals.append(body.status)
+    if body.rows_loaded is not None:
+        fields.append("rows_loaded = %s"); vals.append(body.rows_loaded)
+    if body.error_message is not None:
+        fields.append("error_message = %s"); vals.append(body.error_message[:2000])
+    if body.volume_anomaly_flag is not None:
+        fields.append("volume_anomaly_flag = %s"); vals.append(body.volume_anomaly_flag)
+    if body.phase_completed is not None:
+        fields.append("phase_completed = %s"); vals.append(body.phase_completed)
+
+    # Auto-set ended_at when transitioning to a terminal status
+    terminal = body.status in ("complete", "failed", "success")
+    if terminal:
+        fields.append("ended_at = NOW()")
+
+    if not fields:
+        return {"message": "No fields to update"}
+
+    vals.append(run_id)
+    query(f"UPDATE job_runs SET {', '.join(fields)} WHERE id = %s", vals)
+    return {"message": "Run updated", "run_id": run_id}
+
 @app.post("/pipelines/{pipeline_id}/trigger")
 def trigger_pipeline(pipeline_id: int):
     pipeline_rows = query("SELECT * FROM pipelines WHERE id = %s", (pipeline_id,))
@@ -384,7 +426,6 @@ def trigger_pipeline(pipeline_id: int):
         raise HTTPException(status_code=404, detail="Source connection not found")
     src_conn = dict(conn_rows[0])
 
-    # Resolve destination connection (if any)
     dest_conn = None
     if pipeline.get('destination_connection_id'):
         dest_rows = query("SELECT * FROM connections WHERE id = %s", (pipeline['destination_connection_id'],))
@@ -398,8 +439,29 @@ def trigger_pipeline(pipeline_id: int):
     )
     run_id = run_rows[0]['id']
 
+    # ── AWS path: hand off to Airflow, return immediately ─────────────
+    if ENVIRONMENT == 'aws':
+        dag_id = pipeline.get('dag_id') or f'elt_pipeline_{pipeline_id}'
+        try:
+            import httpx
+            resp = httpx.post(
+                f"{AIRFLOW_ENDPOINT}/api/v1/dags/{dag_id}/dagRuns",
+                json={"conf": {"run_id": run_id, "pipeline_id": pipeline_id}},
+                auth=(AIRFLOW_USER, AIRFLOW_PASSWORD),
+                timeout=15,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            query(
+                "UPDATE job_runs SET status = 'failed', ended_at = NOW(), error_message = %s WHERE id = %s",
+                (f"Failed to trigger Airflow DAG: {e}", run_id)
+            )
+            raise HTTPException(status_code=500, detail=f"Airflow trigger failed: {e}")
+
+        return {"run_id": run_id, "status": "queued", "dag_id": dag_id}
+
+    # ── Local path: run synchronously ─────────────────────────────────
     try:
-        # ── Phase 1: Extract ──────────────────────────────────────────
         query("UPDATE job_runs SET phase_completed = 1 WHERE id = %s", (run_id,))
 
         src = get_source_db(
@@ -431,7 +493,6 @@ def trigger_pipeline(pipeline_id: int):
                 cur.execute(f"SELECT * FROM {pipeline['source_table']}")
                 extracted_rows = cur.fetchall()
 
-            # Fetch column definitions from source
             cur.execute("""
                 SELECT column_name, data_type
                 FROM information_schema.columns
@@ -441,10 +502,8 @@ def trigger_pipeline(pipeline_id: int):
             col_defs = cur.fetchall()
 
         src.close()
-
         rows_extracted = len(extracted_rows)
 
-        # ── Phase 2: Load ─────────────────────────────────────────────
         query("UPDATE job_runs SET phase_completed = 2 WHERE id = %s", (run_id,))
 
         if extracted_rows:
@@ -453,7 +512,6 @@ def trigger_pipeline(pipeline_id: int):
             else:
                 _load_to_mock_postgres(pipeline, col_defs, extracted_rows)
 
-        # ── Volume anomaly check ──────────────────────────────────────
         history = query(
             """SELECT rows_loaded FROM job_runs
                WHERE pipeline_id = %s AND status = 'complete'
