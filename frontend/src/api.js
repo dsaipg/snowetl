@@ -43,4 +43,10 @@ export const api = {
 
   // Dependencies
   getDependencies: () => request('/dependencies'),
+
+  // Schema drift
+  getPipelineDrift: (pipelineId) => request(`/pipelines/${pipelineId}/drift`),
+  getAllPendingDrift: () => request('/drift/pending'),
+  resolveDrift: (driftId, action) =>
+    request(`/drift/${driftId}`, { method: 'PATCH', body: { action } }),
 }

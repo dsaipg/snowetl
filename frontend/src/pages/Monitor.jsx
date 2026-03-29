@@ -178,10 +178,116 @@ function RunDetailModal({ run, onClose }) {
   )
 }
 
+const DRIFT_TYPE_META = {
+  column_added:   { icon: '+', color: 'var(--accent)',  label: 'Column Added' },
+  type_changed:   { icon: '~', color: '#f59e0b',        label: 'Type Changed' },
+  column_dropped: { icon: '-', color: '#ef4444',        label: 'Column Dropped' },
+}
+
+function DriftPanel({ pendingDrift, onResolve }) {
+  if (!pendingDrift.length) return null
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12,
+      }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#f59e0b', letterSpacing: 2 }}>
+          SCHEMA DRIFT — {pendingDrift.length} PENDING REVIEW
+        </div>
+      </div>
+      <div style={{
+        background: 'var(--surface)', border: '1px solid #f59e0b33',
+        borderRadius: 12, overflow: 'hidden',
+      }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ borderBottom: '1px solid var(--border)' }}>
+              {['Pipeline', 'Column', 'Change', 'Was', 'Now', 'Detected', 'Action'].map(h => (
+                <th key={h} style={{
+                  padding: '10px 14px', textAlign: 'left',
+                  fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-muted)',
+                  letterSpacing: 2, fontWeight: 600,
+                }}>{h.toUpperCase()}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {pendingDrift.map((d, idx) => {
+              const meta = DRIFT_TYPE_META[d.change_type] || { icon: '?', color: '#6b7280', label: d.change_type }
+              return (
+                <tr key={d.id} style={{
+                  borderBottom: idx < pendingDrift.length - 1 ? '1px solid var(--border)' : 'none',
+                }}>
+                  <td style={{ padding: '12px 14px', fontSize: 13 }}>{d.pipeline_name}</td>
+                  <td style={{ padding: '12px 14px', fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--accent)' }}>
+                    {d.column_name}
+                  </td>
+                  <td style={{ padding: '12px 14px' }}>
+                    <span style={{
+                      color: meta.color, border: `1px solid ${meta.color}44`,
+                      background: `${meta.color}11`, borderRadius: 4,
+                      padding: '2px 8px', fontFamily: 'var(--mono)', fontSize: 11,
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                    }}>
+                      <span>{meta.icon}</span>{meta.label}
+                    </span>
+                  </td>
+                  <td style={{ padding: '12px 14px', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-muted)' }}>
+                    {d.old_definition || '—'}
+                  </td>
+                  <td style={{ padding: '12px 14px', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text)' }}>
+                    {d.new_definition || '—'}
+                  </td>
+                  <td style={{ padding: '12px 14px', fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
+                    {d.detected_at ? new Date(d.detected_at).toLocaleDateString() : '—'}
+                  </td>
+                  <td style={{ padding: '12px 14px' }}>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      {d.change_type === 'type_changed' && (
+                        <button
+                          onClick={() => onResolve(d.id, 'apply_type_change')}
+                          style={{
+                            background: '#f59e0b22', border: '1px solid #f59e0b55',
+                            color: '#f59e0b', borderRadius: 5, padding: '4px 10px',
+                            fontFamily: 'var(--mono)', fontSize: 11, cursor: 'pointer',
+                          }}
+                          title="Run ALTER TABLE ALTER COLUMN in Snowflake"
+                        >
+                          Apply
+                        </button>
+                      )}
+                      <button
+                        onClick={() => onResolve(d.id, 'dismiss')}
+                        style={{
+                          background: 'transparent', border: '1px solid var(--border)',
+                          color: 'var(--text-muted)', borderRadius: 5, padding: '4px 10px',
+                          fontFamily: 'var(--mono)', fontSize: 11, cursor: 'pointer',
+                        }}
+                        title="Dismiss — mark as resolved without making changes"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
+        + column_added events are auto-resolved (ALTER TABLE ran automatically during pipeline run)
+        &nbsp;|&nbsp; type_changed and column_dropped require manual review
+      </div>
+    </div>
+  )
+}
+
 export default function Monitor() {
   const [pipelines, setPipelines]       = useState([])
   const [allRuns, setAllRuns]           = useState([])
   const [volumeData, setVolumeData]     = useState([])
+  const [pendingDrift, setPendingDrift] = useState([])
   const [selectedPipeline, setSelectedPipeline] = useState('all')
   const [filterStatus, setFilterStatus] = useState('all')
   const [selectedRun, setSelectedRun]   = useState(null)
@@ -189,7 +295,21 @@ export default function Monitor() {
   const [page, setPage]                 = useState(0)
   const PAGE_SIZE = 10
 
+  const loadDrift = () => {
+    api.getAllPendingDrift().then(setPendingDrift).catch(() => {})
+  }
+
+  const handleResolve = async (driftId, action) => {
+    try {
+      await api.resolveDrift(driftId, action)
+      loadDrift()
+    } catch (e) {
+      alert(`Failed to resolve drift: ${e.message}`)
+    }
+  }
+
   useEffect(() => {
+    loadDrift()
     api.getPipelines()
       .then(async (pipes) => {
         setPipelines(pipes)
@@ -310,13 +430,14 @@ export default function Monitor() {
       </div>
 
       {/* Stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12, marginBottom: 28 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 12, marginBottom: 28 }}>
         {[
-          { label: 'TOTAL RUNS',  value: stats.total,    color: 'var(--text)' },
-          { label: 'COMPLETE',    value: stats.complete,  color: 'var(--accent)' },
-          { label: 'FAILED',      value: stats.failed,    color: '#ef4444' },
-          { label: 'RUNNING',     value: stats.running,   color: '#f59e0b' },
-          { label: 'ANOMALIES',   value: stats.anomalies, color: '#f59e0b' },
+          { label: 'TOTAL RUNS',    value: stats.total,           color: 'var(--text)' },
+          { label: 'COMPLETE',      value: stats.complete,        color: 'var(--accent)' },
+          { label: 'FAILED',        value: stats.failed,          color: '#ef4444' },
+          { label: 'RUNNING',       value: stats.running,         color: '#f59e0b' },
+          { label: 'VOL ANOMALIES', value: stats.anomalies,       color: '#f59e0b' },
+          { label: 'SCHEMA DRIFT',  value: pendingDrift.length,   color: pendingDrift.length > 0 ? '#f59e0b' : 'var(--text-muted)' },
         ].map(({ label, value, color }) => (
           <div key={label} style={{
             background: 'var(--surface)', border: '1px solid var(--border)',
@@ -359,6 +480,9 @@ export default function Monitor() {
             </div>
         }
       </div>
+
+      {/* Schema Drift panel */}
+      <DriftPanel pendingDrift={pendingDrift} onResolve={handleResolve} />
 
       {/* Anomaly panel */}
       {anomalies.length > 0 && (

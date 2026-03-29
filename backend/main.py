@@ -561,6 +561,101 @@ TYPE_MAP = {
     'date': 'DATE', 'double precision': 'FLOAT',
 }
 
+def _snowflake_base_type(sf_type: str) -> str:
+    """Extract base type name from Snowflake DESCRIBE TABLE output, e.g. VARCHAR(16777216) → VARCHAR."""
+    return sf_type.split('(')[0].strip().upper()
+
+def _mapped_base_type(pg_type: str) -> str:
+    """Get the base Snowflake type for a Postgres type, e.g. 'character varying' → 'VARCHAR'."""
+    return _snowflake_base_type(TYPE_MAP.get(pg_type, 'TEXT'))
+
+def _detect_and_handle_drift(sf_cur, pipeline_id: int, col_defs, database: str, target_schema: str, target_table: str):
+    """
+    Compare source column definitions against the existing Snowflake table.
+
+    New columns   → ALTER TABLE ADD COLUMN (auto-resolved, pipeline keeps running)
+    Type changes  → logged as pending_review (not auto-applied; Snowflake type changes are risky)
+    Dropped cols  → logged as pending_review (Snowflake keeps old columns; existing data safe)
+
+    Returns list of drift event dicts written to schema_drift_log.
+    """
+    full_table = f"{database}.{target_schema}.{target_table}"
+
+    # Fetch current Snowflake columns via DESCRIBE TABLE
+    try:
+        sf_cur.execute(f"DESCRIBE TABLE {full_table}")
+        rows = sf_cur.fetchall()
+        # DESCRIBE TABLE columns: name, type, kind, null?, default, pk, uq, check, expr, comment, policy name
+        existing = {row[0].upper(): row[1].upper() for row in rows}
+    except Exception:
+        # Table doesn't exist yet — first run, no drift possible
+        return []
+
+    source = {
+        c['column_name'].upper(): TYPE_MAP.get(c['data_type'], 'TEXT')
+        for c in col_defs
+    }
+
+    drift_events = []
+
+    # ── New columns in source not yet in Snowflake → auto-add ───────────────
+    for col_name, col_type in source.items():
+        if col_name not in existing:
+            status = 'auto_resolved'
+            try:
+                sf_cur.execute(f"ALTER TABLE {full_table} ADD COLUMN {col_name} {col_type}")
+            except Exception as e:
+                status = f'error: {str(e)[:200]}'
+            drift_events.append({
+                'pipeline_id': pipeline_id,
+                'column_name': col_name,
+                'change_type': 'column_added',
+                'old_definition': None,
+                'new_definition': col_type,
+                'status': status,
+            })
+
+    # ── Type changes → log only, do not auto-alter ───────────────────────────
+    for col_name, col_type in source.items():
+        if col_name in existing:
+            sf_base = _snowflake_base_type(existing[col_name])
+            src_base = _mapped_base_type(
+                next((c['data_type'] for c in col_defs if c['column_name'].upper() == col_name), '')
+            )
+            if sf_base != src_base:
+                drift_events.append({
+                    'pipeline_id': pipeline_id,
+                    'column_name': col_name,
+                    'change_type': 'type_changed',
+                    'old_definition': existing[col_name],
+                    'new_definition': col_type,
+                    'status': 'pending_review',
+                })
+
+    # ── Columns dropped from source → log only ───────────────────────────────
+    for col_name in existing:
+        if col_name not in source:
+            drift_events.append({
+                'pipeline_id': pipeline_id,
+                'column_name': col_name,
+                'change_type': 'column_dropped',
+                'old_definition': existing[col_name],
+                'new_definition': None,
+                'status': 'pending_review',
+            })
+
+    # ── Persist to metadata DB ────────────────────────────────────────────────
+    for evt in drift_events:
+        query("""
+            INSERT INTO schema_drift_log
+                (pipeline_id, column_name, change_type, old_definition, new_definition, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (evt['pipeline_id'], evt['column_name'], evt['change_type'],
+              evt['old_definition'], evt['new_definition'], evt['status']))
+
+    return drift_events
+
+
 def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     import pandas as pd
     from snowflake.connector.pandas_tools import write_pandas
@@ -569,6 +664,7 @@ def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     target_schema = (pipeline.get('target_schema_name') or dest_conn.get('snowflake_schema') or 'PUBLIC').upper()
     target_table = pipeline['target_table'].upper()
     merge_key = (pipeline.get('merge_key_column') or 'id').lower()
+    pipeline_id = pipeline['id']
 
     # Build DataFrame from extracted rows
     cols = [c['column_name'] for c in col_defs]
@@ -582,12 +678,25 @@ def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
         if dest_conn.get('snowflake_warehouse'):
             cur.execute(f"USE WAREHOUSE {dest_conn['snowflake_warehouse']}")
 
-        # Create table if not exists
+        # Create table if not exists (first run)
         col_sql = ", ".join([
             f"{c['column_name'].upper()} {TYPE_MAP.get(c['data_type'], 'TEXT')}"
             for c in col_defs
         ])
         cur.execute(f"CREATE TABLE IF NOT EXISTS {database}.{target_schema}.{target_table} ({col_sql})")
+
+        # ── Schema drift detection + auto-heal ──────────────────────────────
+        # Runs after CREATE TABLE IF NOT EXISTS so the table always exists here.
+        # New columns are ALTER-ed in before write_pandas runs, so the DataFrame
+        # columns and the Snowflake table columns will match.
+        drift = _detect_and_handle_drift(cur, pipeline_id, col_defs, database, target_schema, target_table)
+        if drift:
+            added = [d for d in drift if d['change_type'] == 'column_added' and d['status'] == 'auto_resolved']
+            pending = [d for d in drift if d['status'] == 'pending_review']
+            if added:
+                print(f"[drift] Auto-added columns: {[d['column_name'] for d in added]}")
+            if pending:
+                print(f"[drift] Pending review: {[(d['column_name'], d['change_type']) for d in pending]}")
 
         # Delete existing rows matching merge key (upsert pattern)
         if merge_key_upper in df.columns:
@@ -599,6 +708,7 @@ def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
             )
 
     # write_pandas: Parquet → internal stage → COPY INTO (bulk, parallel-safe)
+    # By the time we reach here, the Snowflake table has all columns the DataFrame has.
     success, nchunks, nrows, _ = write_pandas(
         conn=sf,
         df=df,
@@ -664,12 +774,16 @@ def get_stats():
         WHERE volume_anomaly_flag = true AND started_at >= NOW() - INTERVAL '7 days'
     """)
 
+    drift_pending = query(
+        "SELECT COUNT(*) as count FROM schema_drift_log WHERE status = 'pending_review'"
+    )
     return {
         "total_pipelines": pipelines[0]['count'],
         "total_connections": connections[0]['count'],
         "runs_today": runs_today[0]['count'],
         "failed_today": failed_today[0]['count'],
-        "anomalies_7d": anomalies[0]['count']
+        "anomalies_7d": anomalies[0]['count'],
+        "drift_pending": drift_pending[0]['count'],
     }
 
 @app.get("/pipelines/{pipeline_id}/volume-history")
@@ -697,3 +811,100 @@ def get_all_dependencies():
         JOIN pipelines p2 ON pd.depends_on_id = p2.id
     """)
     return [dict(r) for r in rows]
+
+
+# ─── Schema Drift ─────────────────────────────────────────────────────
+@app.get("/pipelines/{pipeline_id}/drift")
+def get_drift(pipeline_id: int, status: Optional[str] = None):
+    """List schema drift events for a pipeline. Filter by status if provided."""
+    sql = """
+        SELECT * FROM schema_drift_log
+        WHERE pipeline_id = %s
+    """
+    params = [pipeline_id]
+    if status:
+        sql += " AND status = %s"
+        params.append(status)
+    sql += " ORDER BY detected_at DESC"
+    rows = query(sql, params)
+    return [dict(r) for r in rows]
+
+@app.get("/drift/pending")
+def get_all_pending_drift():
+    """All unresolved drift events across all pipelines, joined with pipeline name."""
+    rows = query("""
+        SELECT d.*, p.name as pipeline_name
+        FROM schema_drift_log d
+        JOIN pipelines p ON d.pipeline_id = p.id
+        WHERE d.status = 'pending_review'
+        ORDER BY d.detected_at DESC
+    """)
+    return [dict(r) for r in rows]
+
+class DriftResolve(BaseModel):
+    action: str          # 'dismiss' | 'apply_type_change'
+    resolved_by: Optional[int] = None
+
+@app.patch("/drift/{drift_id}")
+def resolve_drift(drift_id: int, body: DriftResolve):
+    """
+    Resolve a drift event.
+
+    action=dismiss         — marks as resolved without making a DB change (manual fix done externally)
+    action=apply_type_change — attempts ALTER TABLE ALTER COLUMN in Snowflake, then marks resolved
+    """
+    rows = query("""
+        SELECT d.*, p.connection_id, p.destination_connection_id,
+               p.target_database, p.target_schema_name, p.target_table
+        FROM schema_drift_log d
+        JOIN pipelines p ON d.pipeline_id = p.id
+        WHERE d.id = %s
+    """, (drift_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="Drift event not found")
+    drift = dict(rows[0])
+
+    if body.action == 'dismiss':
+        query("""
+            UPDATE schema_drift_log
+               SET status = 'resolved', resolved_at = NOW(), resolved_by = %s
+             WHERE id = %s
+        """, (body.resolved_by, drift_id))
+        return {"message": "Drift dismissed", "drift_id": drift_id}
+
+    if body.action == 'apply_type_change':
+        if drift['change_type'] != 'type_changed':
+            raise HTTPException(status_code=400, detail="apply_type_change only valid for type_changed events")
+
+        dest_rows = query("SELECT * FROM connections WHERE id = %s", (drift['destination_connection_id'],))
+        if not dest_rows:
+            raise HTTPException(status_code=404, detail="Destination connection not found")
+        dest_conn = dict(dest_rows[0])
+
+        database = (drift['target_database'] or dest_conn['db_name']).upper()
+        schema = (drift['target_schema_name'] or dest_conn.get('snowflake_schema') or 'PUBLIC').upper()
+        table = drift['target_table'].upper()
+        col = drift['column_name']
+        new_type = drift['new_definition']
+
+        # Snowflake supports widening casts; narrowing may fail — that's intentional
+        try:
+            sf = get_snowflake_conn(dest_conn)
+            with sf.cursor() as cur:
+                if dest_conn.get('snowflake_warehouse'):
+                    cur.execute(f"USE WAREHOUSE {dest_conn['snowflake_warehouse']}")
+                cur.execute(
+                    f"ALTER TABLE {database}.{schema}.{table} ALTER COLUMN {col} SET DATA TYPE {new_type}"
+                )
+            sf.close()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"ALTER COLUMN failed: {e}")
+
+        query("""
+            UPDATE schema_drift_log
+               SET status = 'resolved', resolved_at = NOW(), resolved_by = %s
+             WHERE id = %s
+        """, (body.resolved_by, drift_id))
+        return {"message": f"Column {col} type changed to {new_type}", "drift_id": drift_id}
+
+    raise HTTPException(status_code=400, detail=f"Unknown action: {body.action}")
