@@ -202,10 +202,11 @@ function CreatePipelineModal({ onClose, onCreated }) {
     name: '',
     connection_id: '',
     destination_connection_id: '',
+    target_database: '',
+    target_schema_name: '',
     source_table: '',
     watermark_column: '',
     merge_key_column: '',
-    target_schema_name: 'ELT_STAGING',
     target_table: '',
     cron_expression: '0 2 * * *',
     depends_on: [],
@@ -335,8 +336,11 @@ function CreatePipelineModal({ onClose, onCreated }) {
                   className="form-select"
                   value={form.destination_connection_id}
                   onChange={e => {
-                    set('destination_connection_id', e.target.value)
-                    if (e.target.value) set('target_schema_name', 'ELT_STAGING')
+                    const id = e.target.value
+                    set('destination_connection_id', id)
+                    const dest = destinations.find(d => d.id === parseInt(id))
+                    set('target_database', dest?.db_name || '')
+                    set('target_schema_name', dest?.snowflake_schema || '')
                   }}
                 >
                   <option value="">Mock (local Postgres)</option>
@@ -348,11 +352,26 @@ function CreatePipelineModal({ onClose, onCreated }) {
                   <div className="form-hint">No Snowflake connections yet — add one on the Connections page</div>
                 )}
               </div>
-              {selectedDestination && (
-                <div className="form-hint" style={{ padding: '8px 12px', background: 'var(--bg)', borderRadius: 6, border: '1px solid var(--border)' }}>
-                  Writing to: <span style={{ fontFamily: 'var(--mono)', color: 'var(--accent)' }}>
-                    {selectedDestination.db_name}.{selectedDestination.snowflake_schema || 'PUBLIC'}
-                  </span>
+              {form.destination_connection_id && (
+                <div className="form-grid form-grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Target Database</label>
+                    <input
+                      className="form-input"
+                      value={form.target_database}
+                      onChange={e => set('target_database', e.target.value)}
+                      placeholder="e.g. ELT_STAGING"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Target Schema</label>
+                    <input
+                      className="form-input"
+                      value={form.target_schema_name}
+                      onChange={e => set('target_schema_name', e.target.value)}
+                      placeholder="e.g. PUBLIC"
+                    />
+                  </div>
                 </div>
               )}
               {pipelines.length > 0 && (
@@ -475,7 +494,7 @@ function CreatePipelineModal({ onClose, onCreated }) {
                         <div className="form-hint">
                           Will land at: <span style={{ fontFamily: 'var(--mono)', color: 'var(--accent)' }}>
                             {selectedDestination
-                              ? `${selectedDestination.db_name}.${selectedDestination.snowflake_schema || 'PUBLIC'}`
+                              ? `${form.target_database || selectedDestination.db_name}.${form.target_schema_name || selectedDestination.snowflake_schema || 'PUBLIC'}`
                               : 'snowflake_target'}.{form.target_table || '…'}
                           </span>
                         </div>
@@ -530,7 +549,9 @@ function CreatePipelineModal({ onClose, onCreated }) {
                 ['Source Connection', sources.find(c => c.id === parseInt(form.connection_id))?.name || '—'],
                 ['Source Table', form.source_table],
                 ['Destination', selectedDestination ? `❄ ${selectedDestination.name}` : 'Mock (local Postgres)'],
-                ['Target', `${selectedDestination ? `${selectedDestination.db_name}.${selectedDestination.snowflake_schema || 'PUBLIC'}` : 'snowflake_target'}.${form.target_table}`],
+                ['Target', selectedDestination
+                  ? `${form.target_database}.${form.target_schema_name}.${form.target_table}`
+                  : `snowflake_target.${form.target_table}`],
                 ['Watermark Column', form.watermark_column || 'None (full extract)'],
                 ['Merge Key', form.merge_key_column || 'Not set'],
                 ['Schedule', form.cron_expression],
@@ -586,10 +607,11 @@ function EditPipelineModal({ pipeline, onClose, onSaved }) {
     name: pipeline.name,
     connection_id: pipeline.connection_id,
     destination_connection_id: pipeline.destination_connection_id || '',
+    target_database: pipeline.target_database || '',
+    target_schema_name: pipeline.target_schema_name || '',
     source_table: pipeline.source_table,
     watermark_column: pipeline.watermark_column || '',
     merge_key_column: pipeline.merge_key_column || '',
-    target_schema_name: pipeline.target_schema_name || 'ELT_STAGING',
     target_table: pipeline.target_table,
     cron_expression: pipeline.cron_expression || '0 2 * * *',
     depends_on: pipeline.depends_on || [],
@@ -643,9 +665,15 @@ function EditPipelineModal({ pipeline, onClose, onSaved }) {
               </select>
             </div>
             {form.destination_connection_id && (
-              <div className="form-group">
-                <label className="form-label">Target Schema</label>
-                <input className="form-input" value={form.target_schema_name} onChange={e => set('target_schema_name', e.target.value)} placeholder="ELT_STAGING" />
+              <div className="form-grid form-grid-2">
+                <div className="form-group">
+                  <label className="form-label">Target Database</label>
+                  <input className="form-input" value={form.target_database} onChange={e => set('target_database', e.target.value)} placeholder="e.g. ELT_STAGING" />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Target Schema</label>
+                  <input className="form-input" value={form.target_schema_name} onChange={e => set('target_schema_name', e.target.value)} placeholder="e.g. PUBLIC" />
+                </div>
               </div>
             )}
             <div className="form-group">

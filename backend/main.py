@@ -97,7 +97,8 @@ class PipelineCreate(BaseModel):
     source_table: str
     watermark_column: Optional[str] = None
     merge_key_column: Optional[str] = None
-    target_schema_name: str = 'ELT_STAGING'
+    target_database: Optional[str] = None
+    target_schema_name: Optional[str] = None
     target_table: str
     cron_expression: str = "0 2 * * *"
     depends_on: list[int] = []
@@ -311,13 +312,14 @@ def create_pipeline(body: PipelineCreate):
     rows = query(
         """INSERT INTO pipelines
                (name, connection_id, destination_connection_id, source_table,
-                watermark_column, merge_key_column, target_schema_name,
+                watermark_column, merge_key_column,
+                target_database, target_schema_name,
                 target_table, volume_alert_upper_pct, volume_alert_lower_pct, dag_id)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (body.name, body.connection_id, body.destination_connection_id,
          body.source_table, body.watermark_column, body.merge_key_column,
-         body.target_schema_name, body.target_table,
-         body.volume_alert_upper_pct, body.volume_alert_lower_pct, dag_id)
+         body.target_database, body.target_schema_name,
+         body.target_table, body.volume_alert_upper_pct, body.volume_alert_lower_pct, dag_id)
     )
     pipeline_id = rows[0]['id']
 
@@ -342,14 +344,16 @@ def update_pipeline(pipeline_id: int, body: PipelineCreate):
             destination_connection_id = %s,
             watermark_column = %s,
             merge_key_column = %s,
+            target_database = %s,
             target_schema_name = %s,
             target_table = %s,
             volume_alert_upper_pct = %s,
             volume_alert_lower_pct = %s
         WHERE id = %s
     """, (body.name, body.destination_connection_id, body.watermark_column,
-          body.merge_key_column, body.target_schema_name, body.target_table,
-          body.volume_alert_upper_pct, body.volume_alert_lower_pct, pipeline_id))
+          body.merge_key_column, body.target_database, body.target_schema_name,
+          body.target_table, body.volume_alert_upper_pct, body.volume_alert_lower_pct,
+          pipeline_id))
     query("UPDATE schedules SET cron_expression = %s WHERE pipeline_id = %s",
           (body.cron_expression, pipeline_id))
     return {"message": "Pipeline updated"}
@@ -501,8 +505,10 @@ TYPE_MAP = {
 
 def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     sf = get_snowflake_conn(dest_conn)
-    target_schema = (dest_conn.get('snowflake_schema') or 'PUBLIC').upper()
+    database = (pipeline.get('target_database') or dest_conn['db_name']).upper()
+    target_schema = (pipeline.get('target_schema_name') or dest_conn.get('snowflake_schema') or 'PUBLIC').upper()
     target_table = pipeline['target_table'].upper()
+    full_table = f"{database}.{target_schema}.{target_table}"
     merge_key = (pipeline.get('merge_key_column') or 'id').lower()
 
     col_sql = ", ".join([
@@ -514,19 +520,12 @@ def _load_to_snowflake(dest_conn, pipeline, col_defs, extracted_rows):
     placeholders = ", ".join(["%s"] * len(cols))
 
     with sf.cursor() as cur:
-        cur.execute(f"CREATE TABLE IF NOT EXISTS {target_schema}.{target_table} ({col_sql})")
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {full_table} ({col_sql})")
 
         for row in extracted_rows:
             vals = [row[c] for c in cols]
-            # DELETE + INSERT acts as upsert for Snowflake staging tables
-            cur.execute(
-                f"DELETE FROM {target_schema}.{target_table} WHERE {merge_key} = %s",
-                (row[merge_key],)
-            )
-            cur.execute(
-                f"INSERT INTO {target_schema}.{target_table} ({col_names}) VALUES ({placeholders})",
-                vals
-            )
+            cur.execute(f"DELETE FROM {full_table} WHERE {merge_key} = %s", (row[merge_key],))
+            cur.execute(f"INSERT INTO {full_table} ({col_names}) VALUES ({placeholders})", vals)
 
     sf.commit()
     sf.close()
